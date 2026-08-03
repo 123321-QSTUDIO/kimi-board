@@ -328,33 +328,34 @@ INDEX_HTML = """<!DOCTYPE html>
 <title>Kimi Code 用量看板</title>
 <style>
   :root {
-    --bg: #f7f9fd;
+    --bg: #f5f8fd;
     --card: #ffffff;
     --tint: #dcebff;
-    --line: #e5eaf2;
+    --line: #e3e9f4;
     --text: #101828;
-    --dim: #667085;
+    --dim: #5d6b82;
     --faint: #a8b4cc;
     --blue: #3a8dff;
     --blue-deep: #2e6fe8;
     --ink: #0c0e12;
     --mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    --num: "Bahnschrift", "DIN Alternate", "Segoe UI", sans-serif;
     --sans: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
   }
   * { box-sizing: border-box; margin: 0; }
   html { background: var(--bg); }
   body {
     background: transparent; color: var(--text);
-    font-family: var(--sans); padding: 26px 28px 48px;
-    max-width: 1160px; margin: 0 auto;
+    font-family: var(--sans); padding: 26px 32px 48px;
+    max-width: 1420px; margin: 0 auto;
   }
 
   /* ---- 粒子背景 ---- */
   #particles { position: fixed; inset: 0; z-index: -1; pointer-events: none; }
 
   /* ---- 进场动效 ---- */
-  @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
-  .reveal { animation: rise .5s cubic-bezier(.22,.8,.36,1) both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .reveal { animation: rise .32s cubic-bezier(.22,.8,.36,1) both; }
 
   /* ---- 顶栏 ---- */
   .topbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 30px; }
@@ -377,15 +378,14 @@ INDEX_HTML = """<!DOCTYPE html>
   #refresh:hover { background: var(--blue-deep); }
   #refresh:active { transform: scale(.96); }
 
-  /* ---- 主标题 ---- */
-  .hero { position: relative; margin-bottom: 30px; padding: 6px 0 2px; }
-  .hero h1 { font-size: 56px; font-weight: 800; letter-spacing: -.02em; line-height: 1.15; }
-  .hero h1 em { font-style: normal; color: var(--blue); }
+  /* ---- 主信息行 ---- */
+  .hero { position: relative; margin-bottom: 22px; padding: 2px 0; }
   .hero .meta {
-    margin-top: 14px; min-height: 15px;
-    font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
+    min-height: 15px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .2em;
     color: var(--dim); text-transform: uppercase;
   }
+  .hero .meta .hex { font-size: 10px; margin-right: 8px; }
   .glyph-strip {
     position: absolute; right: 0; top: 50%; transform: translateY(-50%);
     font-family: var(--mono); font-size: 14px; letter-spacing: .3em; white-space: nowrap;
@@ -394,7 +394,6 @@ INDEX_HTML = """<!DOCTYPE html>
     mask-image: linear-gradient(90deg, transparent, #000 65%);
   }
   @media (max-width: 860px) {
-    .hero h1 { font-size: 38px; }
     .glyph-strip { display: none; }
   }
 
@@ -403,70 +402,119 @@ INDEX_HTML = """<!DOCTYPE html>
     background: var(--card); border: 1px solid var(--line); border-radius: 18px;
     padding: 22px 24px;
   }
-  .card, section { transition: border-color .18s ease, transform .18s ease; }
-  .card:hover, section:hover { border-color: #c9dfff; transform: translateY(-1px); }
+  .card, section { transition: border-color .18s ease; }
+  .card:hover, section:hover { border-color: #c9dfff; }
+  .card {
+    position: relative; overflow: hidden;
+    background: linear-gradient(180deg, #ffffff 0%, #f6f9ff 100%);
+  }
+  .card::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background-image: radial-gradient(circle, rgba(58,141,255,.30) 1.2px, transparent 1.3px);
+    background-size: 13px 13px;
+    -webkit-mask-image: linear-gradient(to bottom left, #000 0%, transparent 48%);
+    mask-image: linear-gradient(to bottom left, #000 0%, transparent 48%);
+  }
+  .card > * { position: relative; z-index: 1; }
   .caption {
     margin-top: 16px; font-family: var(--mono); font-size: 10px;
     letter-spacing: .3em; color: var(--faint); text-transform: uppercase;
   }
   .card .label {
-    font-size: 13px; color: var(--dim); font-weight: 550;
+    font-size: 15px; color: var(--text); font-weight: 650;
     display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
   }
-  .card .label .hex { font-size: 12px; }
-  .card .value { font-size: 44px; font-weight: 800; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-bottom: 12px; }
-  .card .sub { font-size: 12.5px; color: var(--dim); line-height: 2.0; }
+  .card .label .hex { font-size: 13px; }
+  .card .value { font-family: var(--num); font-size: 46px; font-weight: 700; letter-spacing: .01em; font-variant-numeric: tabular-nums; margin-bottom: 12px; }
+  .card .sub { font-size: 13.5px; color: var(--dim); line-height: 2.0; }
   .card .sub .row { display: flex; justify-content: space-between; gap: 12px; }
   .card .sub .num { font-family: var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
   .pill {
-    display: inline-block; margin-top: 10px; font-size: 11.5px; font-weight: 600;
+    display: inline-block; margin-top: 10px; font-size: 12px; font-weight: 600;
     color: var(--blue-deep); background: rgba(58,141,255,.12);
     border-radius: 999px; padding: 3px 12px; font-family: var(--mono);
   }
 
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 16px; }
-  .card.tint { background: var(--tint); border-color: #c9dfff; }
+  .card.tint {
+    background: linear-gradient(160deg, #eef5ff 0%, #d6e7ff 100%);
+    border-color: #c9dfff;
+  }
+  .card.tint::before {
+    background-image: radial-gradient(circle, rgba(46,111,232,.40) 1.2px, transparent 1.3px);
+  }
   .card.tint .caption { color: #7fa3d8; }
 
   /* ---- 黑色费用卡 ---- */
-  .blackcard { background: var(--ink); border-color: var(--ink); color: #fff; margin-bottom: 16px; }
-  .blackcard .label { font-size: 13px; color: #9aa4b8; font-weight: 550; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-  .blackcard .big { font-size: 46px; font-weight: 800; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-bottom: 14px; }
-  .blackcard .sub { font-size: 12.5px; color: #9aa4b8; line-height: 2.0; }
+  .blackcard {
+    background: linear-gradient(150deg, #141a28 0%, #0a0c11 70%);
+    border-color: #0a0c11; color: #fff; margin-bottom: 16px;
+    position: relative; overflow: hidden;
+  }
+  .cost-left { position: relative; }
+  .cost-left > *:not(.glyph-field) { position: relative; z-index: 1; }
+  .glyph-field {
+    position: absolute; left: 185px; top: 4px; right: 14px; height: 92px;
+    overflow: hidden; pointer-events: none; user-select: none; z-index: 0;
+    -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 15%, #000 97%, transparent 100%);
+    mask-image: linear-gradient(90deg, transparent 0%, #000 15%, #000 97%, transparent 100%);
+  }
+  .glyph-inner {
+    font-family: var(--mono); font-size: 13px; line-height: 1.75; letter-spacing: .28em;
+    white-space: pre; color: #fff; height: 100%;
+    -webkit-mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
+    mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
+  }
+  .blackcard .cost-grid, .blackcard .model-cost, .blackcard .caption { position: relative; z-index: 1; }
+  @media (max-width: 860px) { .glyph-field { display: none; } }
+  .blackcard .label { font-size: 15px; color: #e8edf5; font-weight: 650; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .blackcard .big { font-family: var(--num); font-size: 50px; font-weight: 700; letter-spacing: .01em; font-variant-numeric: tabular-nums; margin-bottom: 14px; }
+  .blackcard .sub { font-size: 13.5px; color: #97a3b6; line-height: 2.0; }
   .blackcard .sub .row { display: flex; justify-content: space-between; gap: 12px; }
   .blackcard .sub .num { font-family: var(--mono); color: #fff; font-variant-numeric: tabular-nums; }
   .blackcard .caption { color: #4b5261; }
   .cost-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 22px; }
   @media (max-width: 860px) { .cost-grid { grid-template-columns: 1fr; } }
   .payback {
-    background: var(--blue); border-radius: 14px; padding: 18px 20px; color: #fff;
+    background: linear-gradient(135deg, #4c9bff 0%, #2e6fe8 100%);
+    border-radius: 14px; padding: 18px 20px; color: #fff;
     display: flex; flex-direction: column; justify-content: center; gap: 8px;
+    position: relative; overflow: hidden;
   }
-  .payback .pb-label { font-size: 13px; opacity: .85; }
-  .payback .pb-value { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .payback::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background-image: radial-gradient(circle, rgba(255,255,255,.32) 1.2px, transparent 1.3px);
+    background-size: 12px 12px;
+    -webkit-mask-image: linear-gradient(to top left, #000 0%, transparent 55%);
+    mask-image: linear-gradient(to top left, #000 0%, transparent 55%);
+  }
+  .payback > * { position: relative; z-index: 1; }
+  .payback .pb-label { font-size: 13.5px; opacity: .85; }
+  .payback .pb-value { font-family: var(--num); font-size: 36px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .payback .pb-bar { height: 8px; background: rgba(255,255,255,.3); border-radius: 999px; overflow: hidden; }
   .payback .pb-fill { height: 100%; background: #fff; border-radius: 999px; }
-  .payback .pb-note { font-size: 12px; opacity: .85; }
-  .model-cost { margin-top: 14px; border-top: 1px solid #232733; padding-top: 12px; }
-  .model-cost .mc-legend { font-size: 11px; color: #6b7385; margin-bottom: 8px; font-family: var(--mono); }
+  .payback .pb-note { font-size: 12.5px; opacity: .85; }
+  .model-cost { margin-top: 12px; border-top: 1px solid #232733; padding-top: 10px; }
+  .model-cost .mc-legend { font-size: 11px; color: #6b7385; margin-bottom: 6px; font-family: var(--mono); }
   .model-cost .mc-legend .sq1 { color: var(--blue); }
   .model-cost .mc-legend .sq2 { color: #3a4152; }
+  .model-cost .bar-row { margin: 6px 0; }
   .model-cost .bar-row .name { color: #9aa4b8; }
   .model-cost .bar-row .track {
     background: transparent; display: flex; flex-direction: column;
-    gap: 3px; height: auto; overflow: visible; border-radius: 0;
+    gap: 2px; height: auto; overflow: visible; border-radius: 0;
   }
-  .model-cost .bar-row .fill { background: var(--blue); height: 8px; }
-  .model-cost .bar-row .fill.prev { background: #3a4152; height: 5px; }
+  .model-cost .bar-row .fill { background: var(--blue); height: 7px; }
+  .model-cost .bar-row .fill.prev { background: #3a4152; height: 4px; }
   .model-cost .bar-row .num {
     color: #fff; width: 130px; display: flex; flex-direction: column;
-    align-items: flex-end; line-height: 1.6;
+    align-items: flex-end; line-height: 1.45;
   }
   .model-cost .prev-num { font-size: 10px; color: #6b7385; }
 
   /* ---- 区块 ---- */
   section { margin-bottom: 16px; }
-  .sec-head { font-size: 14px; font-weight: 650; margin-bottom: 14px; display: flex; align-items: baseline; gap: 10px; }
+  .sec-head { font-size: 16px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: baseline; gap: 10px; }
   .sec-head .right { margin-left: auto; font-size: 11px; color: var(--faint); font-family: var(--mono); font-weight: 400; letter-spacing: .1em; }
   svg { width: 100%; display: block; }
   svg rect.bar {
@@ -478,13 +526,20 @@ INDEX_HTML = """<!DOCTYPE html>
   /* ---- 条形列表 ---- */
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
-  .bar-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; font-size: 12.5px; }
-  .bar-row .name { width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 12px; }
+  .bar-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; font-size: 13px; }
+  .bar-row .name { width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 13px; }
   .bar-row .track { flex: 1; display: block; background: #eef2fa; height: 10px; border-radius: 999px; overflow: hidden; }
   .bar-row .fill { display: block; height: 100%; border-radius: 999px; background: var(--blue); }
-  .bar-row .num { width: 105px; text-align: right; font-family: var(--mono); font-size: 11.5px; color: var(--text); font-variant-numeric: tabular-nums; }
+  .bar-row .num { width: 105px; text-align: right; font-family: var(--mono); font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; }
   .empty { font-size: 12px; color: var(--faint); }
   .err { color: #e5484d; }
+
+  /* ---- 页脚 ---- */
+  .footer {
+    margin-top: 26px; text-align: center;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--faint);
+  }
+  .footer .hex { font-size: 11px; margin-right: 6px; }
 
   @media (prefers-reduced-motion: reduce) {
     .reveal, .live-dot, svg rect.bar { animation: none; }
@@ -506,15 +561,15 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <div class="hero reveal">
   <div class="glyph-strip" aria-hidden="true">− + / ( ) * ▲ K # ⬡ &nbsp; − + / ( ) * ▲ K # ⬡</div>
-  <h1>本机 <em>token</em> 用量</h1>
   <div class="meta" id="heroMeta"></div>
 </div>
 
-<div class="cards reveal" id="cards" style="animation-delay:60ms"></div>
+<div class="cards reveal" id="cards" style="animation-delay:40ms"></div>
 
-<div class="blackcard reveal" style="animation-delay:120ms">
+<div class="blackcard reveal" style="animation-delay:80ms">
   <div class="cost-grid">
-    <div>
+    <div class="cost-left">
+      <div class="glyph-field" aria-hidden="true"><div class="glyph-inner" id="glyphField"></div></div>
       <div class="label"><span class="hex" style="font-size:12px">⬡</span> 等效 API 费用 · 本月</div>
       <div class="big" id="costTotal">¥ --</div>
       <div class="sub" id="costBreakdown"></div>
@@ -525,19 +580,19 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="caption">COST · 04 PAYBACK · 刊例价估算非实际账单</div>
 </div>
 
-<section class="reveal" style="animation-delay:180ms">
+<section class="reveal" style="animation-delay:120ms">
   <div class="sec-head">最近 24 小时 <span class="right">TOKENS / HOUR</span></div>
   <svg id="hourly" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
   <div class="caption">CHART · 05 HOURLY</div>
 </section>
 
-<section class="reveal" style="animation-delay:240ms">
+<section class="reveal" style="animation-delay:160ms">
   <div class="sec-head">最近 30 天 <span class="right">TOKENS / DAY</span></div>
   <svg id="daily" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
   <div class="caption">CHART · 06 DAILY</div>
 </section>
 
-<div class="grid2 reveal" style="animation-delay:300ms">
+<div class="grid2 reveal" style="animation-delay:200ms">
   <section>
     <div class="sec-head">按模型</div>
     <div id="models"></div>
@@ -549,6 +604,8 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="caption">RANK · 08 WORKDIR</div>
   </section>
 </div>
+
+<div class="footer reveal" style="animation-delay:240ms"><span class="hex">⬡</span><span id="footMeta">数据来自本机 wire 文件 · 点刷新同步</span></div>
 
 <script>
 const fmt = n => n.toLocaleString("en-US");
@@ -617,6 +674,53 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":
     else if (!raf) loop();
   });
   loop();
+})();
+
+/* ---- 黑卡字符场（动态变换） ---- */
+(function glyphField() {
+  const el = document.getElementById("glyphField");
+  if (!el) return;
+  const CHARS = "-+/()*▲K#⬡=x";
+  const ROWS = 4, COLS = 52;
+  const cells = [], ts = [];
+  const frag = document.createDocumentFragment();
+  const rnd = () => CHARS[Math.floor(Math.random() * CHARS.length)];
+  const alpha = t => (0.16 + Math.random() * 0.2 + 0.1 * t).toFixed(2);
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const t = c / (COLS - 1);
+      const s = document.createElement("span");
+      if (Math.random() < 0.8 + 0.2 * t) {
+        s.textContent = rnd();
+        s.style.opacity = alpha(t);
+        if (Math.random() < 0.22) s.style.color = "#5ea2ff";
+        s.dataset.on = "1";
+      } else {
+        s.textContent = " ";
+      }
+      cells.push(s); ts.push(t); frag.appendChild(s);
+    }
+    if (r < ROWS - 1) frag.appendChild(document.createTextNode("\\n"));
+  }
+  el.appendChild(frag);
+
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  setInterval(() => {
+    if (document.hidden) return;
+    for (let i = 0; i < 6; i++) {
+      const k = Math.floor(Math.random() * cells.length);
+      const s = cells[k], t = ts[k];
+      if (s.dataset.on) {
+        if (Math.random() < 0.8) { s.textContent = rnd(); }
+        else { s.style.color = s.style.color ? "" : "#5ea2ff"; }
+      } else if (Math.random() < 0.8 + 0.2 * t) {
+        s.textContent = rnd();
+        s.style.opacity = alpha(t);
+        s.dataset.on = "1";
+      }
+    }
+  }, 300);
 })();
 
 /* ---- 数字滚动 ---- */
@@ -733,8 +837,10 @@ async function load() {
   const updated = document.getElementById("updated");
   try {
     const d = await (await fetch("/api/stats", {cache: "no-store"})).json();
-    document.getElementById("heroMeta").textContent =
-      `${(d.cost.planName || "FREE PLAN").toUpperCase()} · ${fmt(d.turns)} TURNS TRACKED`;
+    document.getElementById("heroMeta").innerHTML =
+      `<span class="hex">⬡</span>${esc((d.cost.planName || "FREE PLAN").toUpperCase())} · ${fmt(d.turns)} TURNS TRACKED`;
+    document.getElementById("footMeta").textContent =
+      `数据来自本机 wire 文件 · 更新于 ${new Date(d.generatedAt).toLocaleTimeString("zh-CN", {hour12: false})} · 点刷新同步`;
 
     document.getElementById("cards").innerHTML =
       cardHtml("本月", "USAGE · 01 MONTH", d.cards.month, true) +

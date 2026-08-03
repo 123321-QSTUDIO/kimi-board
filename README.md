@@ -3,7 +3,7 @@
 一个本地、轻量、零云端依赖的 [Kimi Code](https://www.kimi.com/code/) token 消耗看板。
 数据全部来自本机 `~/.kimi-code` 会话记录，统计在本机完成，不上传任何东西。
 
-![image-20260803210638055](img_library/image-20260803210638055.png)
+![image-20260803234710064](img_library/image-20260803234710064.png)
 
 ## 功能
 
