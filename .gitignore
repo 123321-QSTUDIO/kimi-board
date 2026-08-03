@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.build-venv/
+build/
+dist/
+*.spec
+
+# 构建产物（本地打包用；正式 release 由 GitHub Actions 生成）
+release/
+
+# 本地测试产物
+*.log
+.apitest.json
+t.json

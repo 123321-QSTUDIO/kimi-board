@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Kimi Code Token 看板按钮",
+  "version": "1.0.0",
+  "description": "在 Kimi Code WebUI 页面注入一个直达本机 token 用量看板（127.0.0.1:8321）的悬浮按钮。",
+  "content_scripts": [
+    {
+      "matches": [
+        "http://127.0.0.1:58627/*",
+        "http://127.0.0.1:58628/*",
+        "http://127.0.0.1:58629/*",
+        "http://127.0.0.1:58630/*",
+        "http://localhost:58627/*",
+        "http://localhost:58628/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

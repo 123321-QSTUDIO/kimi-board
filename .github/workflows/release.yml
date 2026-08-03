@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build exe
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --name kimi-board --distpath dist --workpath build --specpath build --log-level WARN kimi_board.py
+
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $pkg = "release/kimi-board"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item dist/kimi-board.exe $pkg/
+          Copy-Item start.bat, install-autostart.bat, uninstall-autostart.bat, README.md, LICENSE $pkg/
+          Copy-Item -Recurse extension $pkg/
+          $tag = ${env:GITHUB_REF_NAME}
+          Compress-Archive -Path "$pkg/*" -DestinationPath "release/kimi-board-$tag-windows-x64.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/kimi-board-*.zip
+          generate_release_notes: true
