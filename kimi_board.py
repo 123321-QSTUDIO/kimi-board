@@ -342,11 +342,19 @@ INDEX_HTML = """<!DOCTYPE html>
     --sans: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
   }
   * { box-sizing: border-box; margin: 0; }
+  html { background: var(--bg); }
   body {
-    background: var(--bg); color: var(--text);
+    background: transparent; color: var(--text);
     font-family: var(--sans); padding: 26px 28px 48px;
     max-width: 1160px; margin: 0 auto;
   }
+
+  /* ---- 粒子背景 ---- */
+  #particles { position: fixed; inset: 0; z-index: -1; pointer-events: none; }
+
+  /* ---- 进场动效 ---- */
+  @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+  .reveal { animation: rise .5s cubic-bezier(.22,.8,.36,1) both; }
 
   /* ---- 顶栏 ---- */
   .topbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 30px; }
@@ -354,24 +362,49 @@ INDEX_HTML = """<!DOCTYPE html>
   .crumb { font-size: 13px; color: var(--dim); }
   .crumb b { color: var(--text); font-weight: 600; }
   .spacer { flex: 1; }
+  .live-dot {
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--blue); margin-right: 7px;
+    animation: pulse 2.2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
   #updated { font-size: 12px; color: var(--faint); font-family: var(--mono); }
   #refresh {
     font-size: 13px; font-weight: 550; color: #fff; border: none; cursor: pointer;
     background: var(--blue); border-radius: 10px; padding: 8px 18px;
+    transition: background .15s ease, transform .1s ease;
   }
   #refresh:hover { background: var(--blue-deep); }
+  #refresh:active { transform: scale(.96); }
 
   /* ---- 主标题 ---- */
-  .hero { margin-bottom: 26px; }
-  .hero h1 { font-size: 40px; font-weight: 800; letter-spacing: -.01em; line-height: 1.2; }
+  .hero { position: relative; margin-bottom: 30px; padding: 6px 0 2px; }
+  .hero h1 { font-size: 56px; font-weight: 800; letter-spacing: -.02em; line-height: 1.15; }
   .hero h1 em { font-style: normal; color: var(--blue); }
-  .hero .tagline { margin-top: 10px; font-size: 14px; color: var(--dim); display: flex; align-items: center; gap: 8px; }
+  .hero .meta {
+    margin-top: 14px; min-height: 15px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
+    color: var(--dim); text-transform: uppercase;
+  }
+  .glyph-strip {
+    position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+    font-family: var(--mono); font-size: 14px; letter-spacing: .3em; white-space: nowrap;
+    color: var(--blue); opacity: .5; user-select: none;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 65%);
+    mask-image: linear-gradient(90deg, transparent, #000 65%);
+  }
+  @media (max-width: 860px) {
+    .hero h1 { font-size: 38px; }
+    .glyph-strip { display: none; }
+  }
 
   /* ---- 卡片通用 ---- */
   .card, section, .blackcard {
     background: var(--card); border: 1px solid var(--line); border-radius: 18px;
     padding: 22px 24px;
   }
+  .card, section { transition: border-color .18s ease, transform .18s ease; }
+  .card:hover, section:hover { border-color: #c9dfff; transform: translateY(-1px); }
   .caption {
     margin-top: 16px; font-family: var(--mono); font-size: 10px;
     letter-spacing: .3em; color: var(--faint); text-transform: uppercase;
@@ -381,7 +414,7 @@ INDEX_HTML = """<!DOCTYPE html>
     display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
   }
   .card .label .hex { font-size: 12px; }
-  .card .value { font-size: 40px; font-weight: 800; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-bottom: 12px; }
+  .card .value { font-size: 44px; font-weight: 800; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-bottom: 12px; }
   .card .sub { font-size: 12.5px; color: var(--dim); line-height: 2.0; }
   .card .sub .row { display: flex; justify-content: space-between; gap: 12px; }
   .card .sub .num { font-family: var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
@@ -436,6 +469,11 @@ INDEX_HTML = """<!DOCTYPE html>
   .sec-head { font-size: 14px; font-weight: 650; margin-bottom: 14px; display: flex; align-items: baseline; gap: 10px; }
   .sec-head .right { margin-left: auto; font-size: 11px; color: var(--faint); font-family: var(--mono); font-weight: 400; letter-spacing: .1em; }
   svg { width: 100%; display: block; }
+  svg rect.bar {
+    transform-box: fill-box; transform-origin: 50% 100%;
+    animation: grow .45s cubic-bezier(.22,.8,.36,1) both;
+  }
+  @keyframes grow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
 
   /* ---- 条形列表 ---- */
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -447,26 +485,34 @@ INDEX_HTML = """<!DOCTYPE html>
   .bar-row .num { width: 105px; text-align: right; font-family: var(--mono); font-size: 11.5px; color: var(--text); font-variant-numeric: tabular-nums; }
   .empty { font-size: 12px; color: var(--faint); }
   .err { color: #e5484d; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .reveal, .live-dot, svg rect.bar { animation: none; }
+  }
 </style>
 </head>
 <body>
 
+<canvas id="particles"></canvas>
+
 <div class="topbar">
   <span class="hex">⬡</span>
-  <span class="crumb">看板 &nbsp;›&nbsp; <b>token 用量</b></span>
+  <span class="crumb">Kimi Board &nbsp;›&nbsp; <b>Token 用量</b></span>
   <span class="spacer"></span>
+  <span class="live-dot"></span>
   <span id="updated"></span>
   <button id="refresh">刷新</button>
 </div>
 
-<div class="hero">
+<div class="hero reveal">
+  <div class="glyph-strip" aria-hidden="true">− + / ( ) * ▲ K # ⬡ &nbsp; − + / ( ) * ▲ K # ⬡</div>
   <h1>本机 <em>token</em> 用量</h1>
-  <div class="tagline"><span class="hex" style="font-size:12px">⬡</span> 本机数据 · 逐 turn 统计 · 费用按 Kimi 开放平台刊例价估算</div>
+  <div class="meta" id="heroMeta"></div>
 </div>
 
-<div class="cards" id="cards"></div>
+<div class="cards reveal" id="cards" style="animation-delay:60ms"></div>
 
-<div class="blackcard">
+<div class="blackcard reveal" style="animation-delay:120ms">
   <div class="cost-grid">
     <div>
       <div class="label"><span class="hex" style="font-size:12px">⬡</span> 等效 API 费用 · 本月</div>
@@ -479,19 +525,19 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="caption">COST · 04 PAYBACK · 刊例价估算非实际账单</div>
 </div>
 
-<section>
+<section class="reveal" style="animation-delay:180ms">
   <div class="sec-head">最近 24 小时 <span class="right">TOKENS / HOUR</span></div>
   <svg id="hourly" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
   <div class="caption">CHART · 05 HOURLY</div>
 </section>
 
-<section>
+<section class="reveal" style="animation-delay:240ms">
   <div class="sec-head">最近 30 天 <span class="right">TOKENS / DAY</span></div>
   <svg id="daily" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
   <div class="caption">CHART · 06 DAILY</div>
 </section>
 
-<div class="grid2">
+<div class="grid2 reveal" style="animation-delay:300ms">
   <section>
     <div class="sec-head">按模型</div>
     <div id="models"></div>
@@ -511,11 +557,85 @@ const fmtK = n => n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\\.0$/, "") + "M"
 const yuan = n => "¥ " + n.toLocaleString("zh-CN", {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+/* ---- 粒子网络背景 ---- */
+(function particles() {
+  const cv = document.getElementById("particles");
+  const ctx = cv.getContext("2d");
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const LINK = 130, MLINK = 170;
+  let W = 0, H = 0, pts = [], raf = null;
+  const mouse = {x: -9e3, y: -9e3};
+
+  function resize() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    cv.style.width = W + "px"; cv.style.height = H + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const n = Math.min(110, Math.round(W * H / 18000));
+    pts = Array.from({length: n}, () => ({
+      x: Math.random() * W, y: Math.random() * H,
+      vx: (Math.random() - .5) * .35, vy: (Math.random() - .5) * .35,
+      r: Math.random() * 1.6 + .8
+    }));
+  }
+
+  function step() {
+    ctx.clearRect(0, 0, W, H);
+    for (const p of pts) {
+      p.x += p.vx; p.y += p.vy;
+      if (p.x < -20) p.x = W + 20; else if (p.x > W + 20) p.x = -20;
+      if (p.y < -20) p.y = H + 20; else if (p.y > H + 20) p.y = -20;
+    }
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      for (let j = i + 1; j < pts.length; j++) {
+        const b = pts[j], dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
+        if (d2 < LINK * LINK) {
+          ctx.strokeStyle = `rgba(58,141,255,${((1 - Math.sqrt(d2) / LINK) * .18).toFixed(3)})`;
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        }
+      }
+      const mdx = a.x - mouse.x, mdy = a.y - mouse.y, md2 = mdx * mdx + mdy * mdy;
+      if (md2 < MLINK * MLINK) {
+        ctx.strokeStyle = `rgba(46,111,232,${((1 - Math.sqrt(md2) / MLINK) * .3).toFixed(3)})`;
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(mouse.x, mouse.y); ctx.stroke();
+      }
+      ctx.fillStyle = "rgba(58,141,255,.4)";
+      ctx.beginPath(); ctx.arc(a.x, a.y, a.r, 0, 6.2832); ctx.fill();
+    }
+  }
+
+  function loop() { step(); raf = requestAnimationFrame(loop); }
+  addEventListener("resize", resize);
+  addEventListener("mousemove", e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+  document.addEventListener("mouseleave", () => { mouse.x = -9e3; mouse.y = -9e3; });
+  resize();
+  if (reduce) { step(); return; }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { cancelAnimationFrame(raf); raf = null; }
+    else if (!raf) loop();
+  });
+  loop();
+})();
+
+/* ---- 数字滚动 ---- */
+function countUp(el, target, format) {
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduce || !(target > 0)) { el.textContent = format(target); return; }
+  const t0 = performance.now(), dur = 650;
+  (function tick(t) {
+    const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3);
+    el.textContent = format(target * e);
+    if (k < 1) requestAnimationFrame(tick); else el.textContent = format(target);
+  })(t0);
+}
+
 function cardHtml(label, cap, c, tint) {
   const hitRate = c.input ? (c.cacheRead / c.input * 100).toFixed(1) : "0.0";
   return `<div class="card${tint ? " tint" : ""}">
     <div class="label"><span class="hex">⬡</span>${label}</div>
-    <div class="value">${fmt(c.total)}</div>
+    <div class="value" data-v="${c.total}">0</div>
     <div class="sub">
       <div class="row"><span>输入</span><span class="num">${fmt(c.input)}</span></div>
       <div class="row"><span>其中缓存读取</span><span class="num">${fmt(c.cacheRead)}</span></div>
@@ -552,7 +672,7 @@ function barChart(el, points, labelFn) {
     if (v <= 0) return "";
     const bh = base - y(v), r = Math.min(3, bw / 2);
     const fill = i === lastIdx ? "#2e6fe8" : "#3a8dff";
-    return `<rect x="${x(i).toFixed(1)}" y="${y(v).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="${r}" fill="${fill}">
+    return `<rect class="bar" x="${x(i).toFixed(1)}" y="${y(v).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="${r}" fill="${fill}">
       <title>${esc(labelFn(points[i]))}: ${fmt(v)}</title></rect>`;
   }).join("");
 
@@ -613,13 +733,18 @@ async function load() {
   const updated = document.getElementById("updated");
   try {
     const d = await (await fetch("/api/stats", {cache: "no-store"})).json();
+    document.getElementById("heroMeta").textContent =
+      `${(d.cost.planName || "FREE PLAN").toUpperCase()} · ${fmt(d.turns)} TURNS TRACKED`;
+
     document.getElementById("cards").innerHTML =
       cardHtml("本月", "USAGE · 01 MONTH", d.cards.month, true) +
       cardHtml("今日", "USAGE · 02 TODAY", d.cards.today, false) +
       cardHtml("近 1 小时", "USAGE · 03 HOUR", d.cards.hour, false);
+    document.querySelectorAll("#cards .value").forEach(el =>
+      countUp(el, +el.dataset.v, v => fmt(Math.round(v))));
 
     const c = d.cost;
-    document.getElementById("costTotal").textContent = yuan(c.monthTotal);
+    countUp(document.getElementById("costTotal"), c.monthTotal, yuan);
     document.getElementById("costBreakdown").innerHTML = `
       <div class="row"><span>缓存命中</span><span class="num">${yuan(c.components.cache)}</span></div>
       <div class="row"><span>输入（未命中）</span><span class="num">${yuan(c.components.miss)}</span></div>
