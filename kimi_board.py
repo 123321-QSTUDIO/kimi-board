@@ -608,6 +608,12 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="footer reveal" style="animation-delay:240ms"><span class="hex">⬡</span><span id="footMeta">数据来自本机 wire 文件 · 点刷新同步</span></div>
 
 <script>
+/* ---- 动效覆盖:访问 ?motion=on 后,即使系统开了"减少动画"也强制启用动效(存 localStorage);?motion=off 还原 ---- */
+const _mq = new URLSearchParams(location.search).get("motion");
+if (_mq === "on") localStorage.setItem("kb-motion", "on");
+if (_mq === "off") localStorage.removeItem("kb-motion");
+const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches && localStorage.getItem("kb-motion") !== "on";
+
 const fmt = n => n.toLocaleString("en-US");
 const fmtK = n => n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\\.0$/, "") + "M"
              : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\\.0$/, "") + "K" : String(n);
@@ -618,7 +624,7 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":
 (function particles() {
   const cv = document.getElementById("particles");
   const ctx = cv.getContext("2d");
-  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const reduce = REDUCED;
   const LINK = 130, MLINK = 170;
   let W = 0, H = 0, pts = [], raf = null;
   const mouse = {x: -9e3, y: -9e3};
@@ -705,7 +711,7 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":
   }
   el.appendChild(frag);
 
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  if (REDUCED) return;
   setInterval(() => {
     if (document.hidden) return;
     for (let i = 0; i < 6; i++) {
@@ -725,8 +731,7 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":
 
 /* ---- 数字滚动 ---- */
 function countUp(el, target, format) {
-  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (reduce || !(target > 0)) { el.textContent = format(target); return; }
+  if (REDUCED || !(target > 0)) { el.textContent = format(target); return; }
   const t0 = performance.now(), dur = 650;
   (function tick(t) {
     const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3);
