@@ -18,8 +18,10 @@
 ## 安装（Windows，推荐下载 release）
 
 1. 在 [Releases](../../releases) 下载 `kimi-board-vX.Y.Z-windows-x64.zip` 并解压到任意位置
-2. 双击 **`start.bat`**（运行内置 exe，无需安装 Python），浏览器自动打开看板
-3. 可选：双击 **`install-autostart.bat`**，以后开机静默自启；`uninstall-autostart.bat` 可取消
+2. 双击 **`start.bat`**（运行内置 exe，无需安装 Python）：服务在后台启动并打开看板，
+   关掉终端窗口不影响运行；停止用 `taskkill /im kimi-board.exe /f`
+3. 可选：双击 **`install-autostart.bat`** 立即启动服务并注册开机静默自启；
+   `uninstall-autostart.bat` 可取消自启
 4. 可选（WebUI 悬浮按钮）：Chrome/Edge 打开 `chrome://extensions` →
    开启"开发人员模式" → "加载已解压的扩展程序" → 选择解压目录里的 `extension/` 文件夹。
    之后打开 Kimi Code WebUI（`kimi web`），右下角会出现"⬡ token 看板"按钮

@@ -924,6 +924,12 @@ def main():
     args = ap.parse_args()
     PLAN_PRICE = args.plan_price
 
+    # pythonw / 无控制台环境下 sys.stdout、sys.stderr 为 None,
+    # print 与请求日志会抛 AttributeError,重定向到空设备
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
