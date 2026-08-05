@@ -13,7 +13,7 @@
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-2e6fe8?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
 
-![Kimi Code 用量看板](img_library/Kimi Code 用量看板.png)
+![Kimi Code 用量看板](img_library/Kimi%20Code%20%E7%94%A8%E9%87%8F%E7%9C%8B%E6%9D%BF.png)
 
 </div>
 
