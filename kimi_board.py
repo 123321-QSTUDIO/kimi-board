@@ -62,13 +62,14 @@ def detect_plan():
 
     原理：kimi web 每个实例在 server/instances/ 注册 host/port，
     用 server.token 作为 bearer 调 /api/v1/oauth/userinfo 拿 userLevelName。
-    结果缓存 10 分钟。
+    成功结果缓存 10 分钟；失败只缓存 30 秒（避免 WebUI 短暂掉线后长时间回退默认价）。
     """
     import time
     import urllib.request
 
     now = time.time()
-    if _plan_cache["at"] and now - _plan_cache["at"] < 600:
+    ttl = 600 if _plan_cache["result"] else 30
+    if _plan_cache["at"] and now - _plan_cache["at"] < ttl:
         return _plan_cache["result"]
     result = None
     try:
@@ -140,25 +141,6 @@ def scan_wire_file(wire: Path):
     return records
 
 
-def load_workdir_names(home: Path):
-    """sessionId -> workDir 路径（来自 session_index.jsonl）。"""
-    names = {}
-    idx = home / "session_index.jsonl"
-    try:
-        with idx.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                sid, wd = rec.get("sessionId"), rec.get("workDir")
-                if sid and wd:
-                    names[sid] = wd.replace("/", "\\").rstrip("\\")
-    except OSError:
-        pass
-    return names
-
-
 def empty_usage():
     return {k: 0 for k in USAGE_KEYS}
 
@@ -193,21 +175,20 @@ def collect_stats():
     hour0 = now.replace(minute=0, second=0, microsecond=0)
     hour_bucket0 = int(hour0.timestamp() * 1000) - 23 * 3600 * 1000
     day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_bucket0 = int(day0.timestamp() * 1000) - 29 * 86400 * 1000
+    day_bucket0 = int(day0.timestamp() * 1000) - 30 * 86400 * 1000
 
     cards = {"month": empty_usage(), "today": empty_usage(), "hour": empty_usage()}
     hourly = [empty_usage() for _ in range(24)]
-    daily = [empty_usage() for _ in range(30)]
-    models = defaultdict(lambda: empty_usage())
+    daily = [empty_usage() for _ in range(31)]
+    hourly_models = [defaultdict(empty_usage) for _ in range(24)]
+    daily_models = [defaultdict(empty_usage) for _ in range(31)]
     models_month = defaultdict(lambda: empty_usage())
     models_prev = defaultdict(lambda: empty_usage())
-    workdirs = defaultdict(lambda: empty_usage())
-    wd_names = load_workdir_names(home)
     turns = 0
 
     if sessions_dir.is_dir():
         for wire in sessions_dir.glob("*/*/agents/*/wire.jsonl"):
-            for t, model, sid, usage in scan_wire_file(wire):
+            for t, model, _sid, usage in scan_wire_file(wire):
                 turns += 1
 
                 def add(bucket):
@@ -224,11 +205,13 @@ def collect_stats():
                 if t >= hour_start:
                     add(cards["hour"])
                 if t >= hour_bucket0:
-                    add(hourly[(t - hour_bucket0) // (3600 * 1000)])
+                    i = (t - hour_bucket0) // (3600 * 1000)
+                    add(hourly[i])
+                    add(hourly_models[i][model])
                 if t >= day_bucket0:
-                    add(daily[(t - day_bucket0) // (86400 * 1000)])
-                add(models[model])
-                add(workdirs[wd_names.get(sid, sid)])
+                    i = (t - day_bucket0) // (86400 * 1000)
+                    add(daily[i])
+                    add(daily_models[i][model])
 
     def finalize(u):
         inp = u["inputOther"] + u["inputCacheRead"] + u["inputCacheCreation"]
@@ -238,13 +221,6 @@ def collect_stats():
             "output": u["output"],
             "total": inp + u["output"],
         }
-
-    def top(counter, n=10):
-        rows = sorted(
-            ((name, finalize(u)) for name, u in counter.items()),
-            key=lambda r: -r[1]["total"],
-        )
-        return [{"name": name, **u} for name, u in rows[:n]]
 
     # ---- 费用估算 ----
     cost_by_model = []
@@ -308,13 +284,17 @@ def collect_stats():
             "daysInMonth": days_in_month,
         },
         "hourly": [
-            {"t": hour_bucket0 + i * 3600 * 1000, **finalize(u)} for i, u in enumerate(hourly)
+            {"t": hour_bucket0 + i * 3600 * 1000, **finalize(u),
+             "models": {m: v for m, mu in hourly_models[i].items()
+                        if (v := finalize(mu)["total"]) > 0}}
+            for i, u in enumerate(hourly)
         ],
         "daily": [
-            {"t": day_bucket0 + i * 86400 * 1000, **finalize(u)} for i, u in enumerate(daily)
+            {"t": day_bucket0 + i * 86400 * 1000, **finalize(u),
+             "models": {m: v for m, mu in daily_models[i].items()
+                        if (v := finalize(mu)["total"]) > 0}}
+            for i, u in enumerate(daily)
         ],
-        "models": top(models),
-        "workdirs": top(workdirs),
     }
 
 
@@ -467,7 +447,39 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .blackcard .cost-grid, .blackcard .model-cost, .blackcard .caption { position: relative; z-index: 1; }
   @media (max-width: 860px) { .glyph-field { display: none; } }
-  .blackcard .label { font-size: 15px; color: #e8edf5; font-weight: 650; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .blackcard .label { font-size: 15px; color: #e8edf5; font-weight: 650; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; z-index: 3; }
+  .blackcard .help {
+    position: relative;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #8b96a8; cursor: help;
+    transition: color .15s ease;
+  }
+  .blackcard .help svg { width: 13px; height: 13px; display: block; }
+  .blackcard .help:hover { color: #fff; }
+  .blackcard .help .tip {
+    position: absolute; left: -9px; top: 22px; z-index: 20;
+    width: max-content; max-width: min(320px, 72vw);
+    background: #1b2233; border: 1px solid #31405e; border-radius: 10px;
+    padding: 11px 14px 10px; font-size: 11.5px; font-weight: 400; line-height: 1.6; color: #8f9ab0;
+    opacity: 0; visibility: hidden; transform: translateY(-4px);
+    transition: opacity .15s ease, transform .15s ease, visibility .15s;
+    pointer-events: none;
+  }
+  .blackcard .help:hover .tip { opacity: 1; visibility: visible; transform: translateY(0); }
+  .blackcard .help .tp-f { display: block; margin-bottom: 8px; }
+  .blackcard .help .tp-f b { color: #dbe3ef; font-weight: 500; }
+  .blackcard .help .tp-t { display: block; border-top: 1px solid #2a3450; padding: 5px 0 4px; }
+  .blackcard .help .tp-r {
+    display: grid; grid-template-columns: 1fr 42px 42px 46px; align-items: baseline;
+    line-height: 1.9;
+  }
+  .blackcard .help .tp-r b { color: #dbe3ef; font-weight: 500; font-size: 11px; }
+  .blackcard .help .tp-r i {
+    font-family: var(--mono); font-style: normal; font-size: 11px; text-align: right;
+    color: #fff; font-variant-numeric: tabular-nums;
+  }
+  .blackcard .help .tp-r.tp-h i { color: #5d6a85; font-size: 10px; }
+  .blackcard .help .tp-note { display: block; border-top: 1px solid #2a3450; padding-top: 6px; font-size: 10.5px; color: #5d6a85; }
   .blackcard .big { font-family: var(--num); font-size: 50px; font-weight: 700; letter-spacing: .01em; font-variant-numeric: tabular-nums; margin-bottom: 14px; }
   .blackcard .sub { font-size: 13.5px; color: #97a3b6; line-height: 2.0; }
   .blackcard .sub .row { display: flex; justify-content: space-between; gap: 12px; }
@@ -516,16 +528,65 @@ INDEX_HTML = """<!DOCTYPE html>
   section { margin-bottom: 16px; }
   .sec-head { font-size: 16px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: baseline; gap: 10px; }
   .sec-head .right { margin-left: auto; font-size: 11px; color: var(--faint); font-family: var(--mono); font-weight: 400; letter-spacing: .1em; }
+
+  /* ---- 趋势图:范围切换 + 汇总条(DeepSeek 式,融入白卡体系) ---- */
+  .trendcard { position: relative; }
+  .seg { display: inline-flex; position: relative; background: #eef1f6; border-radius: 999px; padding: 3px; gap: 2px; letter-spacing: 0; }
+  .seg .seg-pill {
+    position: absolute; top: 3px; bottom: 3px; left: 3px; width: 0;
+    background: #fff; border-radius: 999px; z-index: 0;
+    transition: left .25s cubic-bezier(.22,.8,.36,1), width .25s cubic-bezier(.22,.8,.36,1);
+  }
+  .seg button {
+    position: relative; z-index: 1;
+    border: 0; background: transparent; cursor: pointer; font-family: inherit;
+    font-size: 12.5px; line-height: 1; color: var(--dim); border-radius: 999px; padding: 6px 13px;
+    transition: color .15s ease;
+  }
+  .seg button:hover { color: var(--text); }
+  .seg button.on { color: var(--blue-deep); font-weight: 600; }
+  .trend-sum { display: flex; gap: 14px; flex-wrap: wrap; margin: -2px 0 12px; }
+  .trend-sum .ts {
+    background: #f5f7fb; border-radius: 12px; padding: 10px 18px 12px;
+    display: flex; flex-direction: column; gap: 4px; width: 190px; flex: 0 0 auto;
+  }
+  .trend-sum .ts .lb { font-size: 12.5px; color: var(--dim); }
+  .trend-sum .ts .vl { display: flex; align-items: baseline; gap: 7px; width: 100%; white-space: nowrap; }
+  .trend-sum .ts b { font-family: var(--num); font-size: 22px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+  .trend-sum .ts .unit { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-left: auto; }
+  .trend-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 0 0 6px; font-size: 12px; color: var(--dim); }
+  .trend-legend .lg { display: inline-flex; align-items: baseline; gap: 7px; }
+  .trend-legend .lg .sq { align-self: center; }
+  .trend-legend .sq { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .trend-legend .amt { font-family: var(--mono); color: var(--faint); font-size: 11px; }
+
+  /* 悬浮平滑过渡 */
+  #trend rect.bar { transition: opacity .15s ease; }
+  #trend #xh { transition: transform .12s ease-out; }
+  #trendTip {
+    position: absolute; left: 0; top: 0; z-index: 2; pointer-events: none;
+    background: #fff; border: 1px solid #e2e6ee; border-radius: 10px;
+    padding: 10px 14px; min-width: 168px;
+    opacity: 0; visibility: hidden;
+    transition: transform .12s ease-out, opacity .12s ease, visibility .12s;
+  }
+  #trendTip.show { opacity: 1; visibility: visible; }
+  #trendTip .tt-head { display: flex; justify-content: space-between; align-items: baseline; gap: 18px; }
+  #trendTip .tt-date { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+  #trendTip .tt-total { font-family: var(--num); font-size: 13.5px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+  #trendTip .tt-div { height: 1px; background: #eef1f6; margin: 7px 0 5px; }
+  #trendTip .tt-row { display: flex; align-items: center; gap: 8px; line-height: 22px; font-size: 12px; color: var(--dim); }
+  #trendTip .tt-sq { width: 9px; height: 9px; border-radius: 2.5px; flex: 0 0 auto; }
+  #trendTip .tt-val { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; padding-left: 18px; }
+
   svg { width: 100%; display: block; }
-  svg rect.bar {
+  svg g.barg {
     transform-box: fill-box; transform-origin: 50% 100%;
     animation: grow .45s cubic-bezier(.22,.8,.36,1) both;
   }
   @keyframes grow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
 
   /* ---- 条形列表 ---- */
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
   .bar-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; font-size: 13px; }
   .bar-row .name { width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 13px; }
   .bar-row .track { flex: 1; display: block; background: #eef2fa; height: 10px; border-radius: 999px; overflow: hidden; }
@@ -542,7 +603,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .footer .hex { font-size: 11px; margin-right: 6px; }
 
   @media (prefers-reduced-motion: reduce) {
-    .reveal, .live-dot, svg rect.bar { animation: none; }
+    .reveal, .live-dot, svg g.barg { animation: none; }
   }
 </style>
 </head>
@@ -570,7 +631,17 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="cost-grid">
     <div class="cost-left">
       <div class="glyph-field" aria-hidden="true"><div class="glyph-inner" id="glyphField"></div></div>
-      <div class="label"><span class="hex" style="font-size:12px">⬡</span> 等效 API 费用 · 本月</div>
+      <div class="label"><span class="hex" style="font-size:12px">⬡</span> 等效 API 费用 · 本月
+        <span class="help"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.2"/><path d="M9.4 9a2.7 2.7 0 0 1 5.25.9c0 1.8-2.65 2.4-2.65 3.6"/><line x1="12" y1="16.8" x2="12.01" y2="16.8"/></svg><span class="tip">
+          <span class="tp-f"><b>等效费用</b> = 缓存×缓存价 + 输入×输入价 + 输出×输出价</span>
+          <span class="tp-t">
+            <span class="tp-r tp-h"><b>元 / 1M</b><i>缓存</i><i>输入</i><i>输出</i></span>
+            <span class="tp-r"><b>k3 / k3-256k</b><i>2</i><i>20</i><i>100</i></span>
+            <span class="tp-r"><b>kimi-for-coding</b><i>1.3</i><i>6.5</i><i>27</i></span>
+          </span>
+          <span class="tp-note">刊例价估算 · 非实际账单 · 缓存创建按输入价计</span>
+        </span></span>
+      </div>
       <div class="big" id="costTotal">¥ --</div>
       <div class="sub" id="costBreakdown"></div>
     </div>
@@ -580,32 +651,18 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="caption">COST · 04 PAYBACK · 刊例价估算非实际账单</div>
 </div>
 
-<section class="reveal" style="animation-delay:120ms">
-  <div class="sec-head">最近 24 小时 <span class="right">TOKENS / HOUR</span></div>
-  <svg id="hourly" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
-  <div class="caption">CHART · 05 HOURLY</div>
+<section class="trendcard reveal" style="animation-delay:120ms">
+  <div class="sec-head">用量趋势
+    <span class="right seg" id="rangeSeg"><span class="seg-pill" aria-hidden="true"></span><button data-r="24h">24 小时</button><button data-r="7d" class="on">7 天</button><button data-r="30d">30 天</button><button data-r="mtd">本月</button></span>
+  </div>
+  <div class="trend-sum" id="trendSum"></div>
+  <div class="trend-legend" id="trendLegend"></div>
+  <svg id="trend" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
+  <div id="trendTip"></div>
+  <div class="caption">CHART · 05 TREND</div>
 </section>
 
-<section class="reveal" style="animation-delay:160ms">
-  <div class="sec-head">最近 30 天 <span class="right">TOKENS / DAY</span></div>
-  <svg id="daily" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
-  <div class="caption">CHART · 06 DAILY</div>
-</section>
-
-<div class="grid2 reveal" style="animation-delay:200ms">
-  <section>
-    <div class="sec-head">按模型</div>
-    <div id="models"></div>
-    <div class="caption">RANK · 07 MODEL</div>
-  </section>
-  <section>
-    <div class="sec-head">按工作目录</div>
-    <div id="workdirs"></div>
-    <div class="caption">RANK · 08 WORKDIR</div>
-  </section>
-</div>
-
-<div class="footer reveal" style="animation-delay:240ms"><span class="hex">⬡</span><span id="footMeta">数据来自本机 wire 文件 · 点刷新同步</span></div>
+<div class="footer reveal" style="animation-delay:200ms"><span class="hex">⬡</span><span id="footMeta">数据来自本机 wire 文件 · 点刷新同步</span></div>
 
 <script>
 /* ---- 动效覆盖:访问 ?motion=on 后,即使系统开了"减少动画"也强制启用动效(存 localStorage);?motion=off 还原 ---- */
@@ -755,16 +812,112 @@ function cardHtml(label, cap, c, tint) {
   </div>`;
 }
 
-function barChart(el, points, labelFn) {
-  const W = 1000, H = 240, PADL = 44, PADR = 14, PADT = 14, PADB = 26;
+/* ---- 用量趋势:单图 + 范围切换(选择存 localStorage);按模型堆叠(DeepSeek 式) ---- */
+const TREND = { range: localStorage.getItem("kb-range") || "7d", data: null, order: [], color: {} };
+const TREND_PALETTE = ["#2e6fe8", "#5ea2ff", "#9ec4ff", "#c9ddff", "#dfe9fa"]; // 末位为"其他"
+const shortName = m => m === "其他" ? m : m.replace(/^kimi-code\//, "");
+
+function trendLabel(p, kind, long) {
+  const dt = new Date(p.t);
+  const iso = dt.getFullYear() + "-" + String(dt.getMonth() + 1).padStart(2, "0") + "-" + String(dt.getDate()).padStart(2, "0");
+  if (kind === "hour") {
+    const hh = String(dt.getHours()).padStart(2, "0") + ":00";
+    return long ? iso + " " + hh : hh;
+  }
+  return long ? iso : (dt.getMonth() + 1) + "/" + dt.getDate();
+}
+
+function trendPoints() {
+  const d = TREND.data;
+  if (TREND.range === "24h") return { pts: d.hourly, kind: "hour" };
+  if (TREND.range === "7d") return { pts: d.daily.slice(-7), kind: "day" };
+  if (TREND.range === "30d") return { pts: d.daily.slice(-30), kind: "day" };
+  const now = new Date();
+  const pts = d.daily.filter(p => {
+    const dt = new Date(p.t);
+    return dt.getFullYear() === now.getFullYear() && dt.getMonth() === now.getMonth();
+  });
+  // 补齐本月未来日期(空桶),让"本月"显示整月
+  const dim = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  for (let day = now.getDate() + 1; day <= dim; day++) {
+    pts.push({ t: new Date(now.getFullYear(), now.getMonth(), day).getTime(),
+               input: 0, cacheRead: 0, output: 0, total: 0, models: {} });
+  }
+  return { pts, kind: "day" };
+}
+
+/* 取某桶内归属 key(前 4 模型或"其他")的用量 */
+function segValue(p, key) {
+  let sv = 0;
+  for (const [name, val] of Object.entries(p.models || {})) {
+    if ((TREND.color[name] ? name : "其他") === key) sv += val;
+  }
+  return sv;
+}
+
+function renderTrend() {
+  if (!TREND.data) return;
+  const { pts, kind } = trendPoints();
+  let tot = 0, peak = pts[0];
+  const modelSums = {};
+  for (const p of pts) {
+    tot += p.total;
+    if (p.total > peak.total) peak = p;
+    for (const m of TREND.order) {
+      const sv = segValue(p, m);
+      if (sv > 0) modelSums[m] = (modelSums[m] || 0) + sv;
+    }
+  }
+  const avg = pts.length ? Math.round(tot / pts.length) : 0;
+  document.getElementById("trendSum").innerHTML = `
+    <div class="ts"><span class="lb">合计</span><span class="vl"><b id="tsTotal">0</b><span class="unit">tokens</span></span></div>
+    <div class="ts"><span class="lb">峰值</span><span class="vl"><b>${fmtK(peak.total)}</b><span class="unit">${esc(kind === "hour" ? trendLabel(peak, kind, true).slice(5) : trendLabel(peak, kind, true))}</span></span></div>
+    <div class="ts"><span class="lb">${kind === "hour" ? "时均" : "日均"}</span><span class="vl"><b>${fmtK(avg)}</b><span class="unit">tokens</span></span></div>`;
+  countUp(document.getElementById("tsTotal"), tot, v => fmtK(Math.round(v)));
+  document.getElementById("trendLegend").innerHTML = TREND.order
+    .filter(m => modelSums[m] > 0)
+    .map(m => `<span class="lg"><span class="sq" style="background:${TREND.color[m]}"></span>${esc(shortName(m))} <span class="amt">${fmtK(modelSums[m])}</span></span>`).join("");
+  barChart(document.getElementById("trend"), pts, kind);
+}
+
+function placeSegPill() {
+  const seg = document.getElementById("rangeSeg");
+  const pill = seg.querySelector(".seg-pill");
+  const on = seg.querySelector("button.on");
+  if (!on) return;
+  pill.style.left = on.offsetLeft + "px";
+  pill.style.width = on.offsetWidth + "px";
+}
+
+document.querySelectorAll("#rangeSeg button").forEach(b => b.onclick = () => {
+  TREND.range = b.dataset.r;
+  localStorage.setItem("kb-range", TREND.range);
+  document.querySelectorAll("#rangeSeg button").forEach(x => x.classList.toggle("on", x === b));
+  placeSegPill();
+  renderTrend();
+});
+requestAnimationFrame(placeSegPill);
+
+let trendRszT = 0;
+addEventListener("resize", () => {
+  clearTimeout(trendRszT);
+  trendRszT = setTimeout(() => { placeSegPill(); renderTrend(); }, 150);
+});
+
+function barChart(el, points, kind) {
+  const H = 240, PADL = 44, PADR = 14, PADT = 14, PADB = 26;
+  const W = Math.max(320, Math.round(el.getBoundingClientRect().width)
+    || (el.parentElement ? el.parentElement.clientWidth : 0) || 1000);
+  el.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const vals = points.map(p => p.total);
   const rawMax = Math.max(...vals, 1);
   const mag = Math.pow(10, Math.floor(Math.log10(rawMax)));
   const max = Math.ceil(rawMax / mag * 2) / 2 * mag;
   const n = points.length;
   const slot = (W - PADL - PADR) / n;
-  const bw = Math.max(2, slot * 0.62);
+  const bw = Math.min(64, Math.max(2, slot * 0.62));
   const x = i => PADL + i * slot + (slot - bw) / 2;
+  const cx = i => PADL + i * slot + slot / 2;
   const y = v => PADT + (1 - v / max) * (H - PADT - PADB);
   const base = H - PADB;
 
@@ -775,31 +928,59 @@ function barChart(el, points, labelFn) {
     ylabels += `<text x="${PADL - 8}" y="${gy + 3.5}" font-size="10" fill="#a8b4cc" text-anchor="end" font-family="ui-monospace,Consolas,monospace">${fmtK(gv)}</text>`;
   }
 
-  let lastIdx = -1;
-  for (let i = n - 1; i >= 0; i--) if (vals[i] > 0) { lastIdx = i; break; }
   const bars = vals.map((v, i) => {
     if (v <= 0) return "";
-    const bh = base - y(v), r = Math.min(3, bw / 2);
-    const fill = i === lastIdx ? "#2e6fe8" : "#3a8dff";
-    return `<rect class="bar" x="${x(i).toFixed(1)}" y="${y(v).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="${r}" fill="${fill}">
-      <title>${esc(labelFn(points[i]))}: ${fmt(v)}</title></rect>`;
+    const segs = TREND.order.map(m => ({ m, v: segValue(points[i], m) })).filter(s => s.v > 0);
+    const r = Math.min(3, bw / 2);
+    let acc = 0, out = "";
+    segs.forEach((s, si) => {
+      const y1 = y(acc + s.v), y0 = y(acc);
+      const rx = si === segs.length - 1 ? (segs.length === 1 ? r : Math.min(2, r)) : 0;
+      out += `<rect class="bar" data-i="${i}" x="${x(i).toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${(y0 - y1).toFixed(1)}" rx="${rx}" fill="${TREND.color[s.m]}"/>`;
+      acc += s.v;
+    });
+    return `<g class="barg">${out}</g>`;
   }).join("");
 
   const step = Math.ceil(n / 8);
   const xlabels = points.map((p, i) => i % step ? "" :
-    `<text x="${(PADL + i * slot + slot / 2).toFixed(1)}" y="${H - 7}" font-size="10" fill="#a8b4cc" text-anchor="middle" font-family="ui-monospace,Consolas,monospace">${esc(labelFn(p))}</text>`).join("");
+    `<text x="${cx(i).toFixed(1)}" y="${H - 7}" font-size="10" fill="#a8b4cc" text-anchor="middle" font-family="ui-monospace,Consolas,monospace">${esc(trendLabel(p, kind))}</text>`).join("");
 
-  el.innerHTML = `${grid}${ylabels}${bars}${xlabels}`;
-}
+  el.innerHTML = `${grid}${ylabels}${bars}${xlabels}
+    <line id="xh" x1="0" y1="${PADT}" x2="0" y2="${base}" stroke="#2e6fe8" stroke-width="1" stroke-dasharray="3 3" visibility="hidden"/>`;
 
-function barList(el, rows, unit) {
-  if (!rows.length) { el.innerHTML = '<span class="empty">暂无数据</span>'; return; }
-  const max = Math.max(...rows.map(r => r.value), 0.01);
-  el.innerHTML = rows.map(r => `<div class="bar-row" title="${esc(r.name)}">
-    <span class="name">${esc(r.name)}</span>
-    <span class="track"><span class="fill" style="width:${(r.value / max * 100).toFixed(1)}%"></span></span>
-    <span class="num">${unit ? unit(r.value) : fmt(r.value)}</span>
-  </div>`).join("");
+  const barEls = el.querySelectorAll("rect.bar");
+  const xh = el.querySelector("#xh");
+  const tip = document.getElementById("trendTip");
+  const sec = el.closest("section");
+  el.onmousemove = e => {
+    const r = el.getBoundingClientRect();
+    const vx = (e.clientX - r.left) / r.width * W;
+    const i = Math.floor((vx - PADL) / slot);
+    if (i < 0 || i >= n) { el.onmouseleave(); return; }
+    const p = points[i], v = vals[i];
+    xh.style.transform = `translateX(${cx(i)}px)`;
+    xh.setAttribute("visibility", "visible");
+    barEls.forEach(b => b.style.opacity = +b.dataset.i === i ? 1 : .3);
+    const rows = TREND.order.map(m => ({ m, v: segValue(p, m) })).filter(s => s.v > 0);
+    tip.innerHTML = `<div class="tt-head"><span class="tt-date">${esc(trendLabel(p, kind, true))}</span><span class="tt-total">${fmt(v)}</span></div>` +
+      (rows.length ? `<div class="tt-div"></div>` + rows.map(s =>
+        `<div class="tt-row"><span class="tt-sq" style="background:${TREND.color[s.m]}"></span>${esc(shortName(s.m))}<span class="tt-val">${fmtK(s.v)}</span></div>`).join("") : "");
+    const sr = sec.getBoundingClientRect();
+    const relX = e.clientX - sr.left, relY = e.clientY - sr.top;
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let tx = relX + 14;
+    if (tx + tw > sr.width - 8) tx = relX - tw - 14;
+    let ty = relY - th - 12;
+    if (ty < 4) ty = relY + 18;
+    tip.style.transform = `translate(${tx.toFixed(1)}px, ${ty.toFixed(1)}px)`;
+    tip.classList.add("show");
+  };
+  el.onmouseleave = () => {
+    xh.setAttribute("visibility", "hidden");
+    tip.classList.remove("show");
+    barEls.forEach(b => b.style.opacity = 1);
+  };
 }
 
 function modelCostList(el, rows) {
@@ -863,14 +1044,19 @@ async function load() {
     document.getElementById("payback").innerHTML = paybackHtml(c);
     modelCostList(document.getElementById("modelCost"), c.byModel);
 
-    barChart(document.getElementById("hourly"), d.hourly,
-      p => String(new Date(p.t).getHours()).padStart(2, "0") + ":00");
-    barChart(document.getElementById("daily"), d.daily, p => {
-      const dt = new Date(p.t);
-      return String(dt.getMonth() + 1).padStart(2, "0") + "-" + String(dt.getDate()).padStart(2, "0");
-    });
-    barList(document.getElementById("models"), d.models.map(m => ({name: m.name, value: m.total})));
-    barList(document.getElementById("workdirs"), d.workdirs.map(w => ({name: w.name, value: w.total})));
+    TREND.data = d;
+    const _sums = {};
+    for (const p of [...d.hourly, ...d.daily])
+      for (const [m, v] of Object.entries(p.models || {})) _sums[m] = (_sums[m] || 0) + v;
+    const _top = Object.entries(_sums).sort((a, b) => b[1] - a[1]).map(e => e[0]);
+    TREND.order = _top.slice(0, 4);
+    if (_top.length > 4) TREND.order.push("其他");
+    TREND.color = {};
+    TREND.order.forEach((m, i) => TREND.color[m] = TREND_PALETTE[i]);
+    document.querySelectorAll("#rangeSeg button").forEach(x =>
+      x.classList.toggle("on", x.dataset.r === TREND.range));
+    placeSegPill();
+    renderTrend();
     updated.textContent = `更新于 ${new Date(d.generatedAt).toLocaleString("zh-CN", {hour12: false})} · ${fmt(d.turns)} turns`;
     updated.classList.remove("err");
   } catch (e) {

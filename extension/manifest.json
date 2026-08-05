@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Kimi Code Token 看板按钮",
-  "version": "1.0.0",
-  "description": "在 Kimi Code WebUI 页面注入一个直达本机 token 用量看板（127.0.0.1:8321）的悬浮按钮。",
+  "name": "Kimi Board · Token 用量看板",
+  "version": "1.2.0",
+  "description": "在 Kimi Code WebUI 侧栏实时显示本月 token 用量，一键打开本机用量看板。需配合本机 kimi-board 服务使用。",
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
   "content_scripts": [
     {
       "matches": [
