@@ -37,4 +37,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release/kimi-board-*.zip
-          generate_release_notes: true
