@@ -36,11 +36,17 @@ USAGE_KEYS = ("inputOther", "inputCacheRead", "inputCacheCreation", "output")
 # Kimi 开放平台刊例价（元 / 1M tokens）：(缓存命中, 输入未命中, 输出)
 # https://platform.kimi.com/docs/pricing/chat
 PRICING = {
-    "kimi-code/k3": (2.0, 20.0, 100.0),
-    "kimi-code/k3-256k": (2.0, 20.0, 100.0),          # k3 的 256k 变体，按 k3 价
-    "kimi-code/kimi-for-coding": (1.3, 6.5, 27.0),    # 对应 kimi-k2.7-code
+    "kimi-code/k3": (2.0, 20.0, 100.0),                     # kimi-k3
+    "kimi-code/k3-256k": (2.0, 20.0, 100.0),                # k3 的 256k 变体，按 k3 价
+    "kimi-code/kimi-for-coding-highspeed": (2.6, 13.0, 54.0),  # kimi-k2.7-code-highspeed
+    "kimi-code/kimi-for-coding": (1.3, 6.5, 27.0),          # kimi-k2.7-code
 }
 DEFAULT_PRICE = (2.0, 20.0, 100.0)
+
+
+def price_of(model: str):
+    """查模型单价；容忍日志里不带 kimi-code/ 前缀的写法。"""
+    return PRICING.get(model) or PRICING.get(f"kimi-code/{model}", DEFAULT_PRICE)
 
 # Kimi 会员档位 -> 月付价格（元）
 # https://www.kimi.com/zh-cn/resources/kimi-k3-pricing
@@ -147,7 +153,7 @@ def empty_usage():
 
 def cost_of(model: str, u: dict) -> float:
     """按刊例价估算费用（元）。inputCacheCreation 按未命中输入计。"""
-    hit, miss, out = PRICING.get(model, DEFAULT_PRICE)
+    hit, miss, out = price_of(model)
     return (
         u["inputCacheRead"] * hit
         + (u["inputOther"] + u["inputCacheCreation"]) * miss
@@ -226,7 +232,7 @@ def collect_stats():
     cost_by_model = []
     month_cost = cache_cost = miss_cost = out_cost = 0.0
     for model, u in models_month.items():
-        hit, miss, out = PRICING.get(model, DEFAULT_PRICE)
+        hit, miss, out = price_of(model)
         cc = u["inputCacheRead"] * hit / 1e6
         mc = (u["inputOther"] + u["inputCacheCreation"]) * miss / 1e6
         oc = u["output"] * out / 1e6
@@ -637,7 +643,8 @@ INDEX_HTML = """<!DOCTYPE html>
           <span class="tp-t">
             <span class="tp-r tp-h"><b>元 / 1M</b><i>缓存</i><i>输入</i><i>输出</i></span>
             <span class="tp-r"><b>k3 / k3-256k</b><i>2</i><i>20</i><i>100</i></span>
-            <span class="tp-r"><b>kimi-for-coding</b><i>1.3</i><i>6.5</i><i>27</i></span>
+            <span class="tp-r"><b>k2.7-highspeed</b><i>2.6</i><i>13</i><i>54</i></span>
+            <span class="tp-r"><b>k2.7</b><i>1.3</i><i>6.5</i><i>27</i></span>
           </span>
           <span class="tp-note">刊例价估算 · 非实际账单 · 缓存创建按输入价计</span>
         </span></span>
@@ -815,7 +822,24 @@ function cardHtml(label, cap, c, tint) {
 /* ---- 用量趋势:单图 + 范围切换(选择存 localStorage);按模型堆叠(DeepSeek 式) ---- */
 const TREND = { range: localStorage.getItem("kb-range") || "7d", data: null, order: [], color: {} };
 const TREND_PALETTE = ["#2e6fe8", "#5ea2ff", "#9ec4ff", "#c9ddff", "#dfe9fa"]; // 末位为"其他"
-const shortName = m => m === "其他" ? m : m.replace(/^kimi-code\//, "");
+// 固定色：能力越强的模型颜色越深（k3 > k3-256k > k2.7-highspeed > k2.7）
+const MODEL_COLOR = {
+  "kimi-code/k3": "#2e6fe8",
+  "kimi-code/k3-256k": "#5ea2ff",
+  "kimi-code/kimi-for-coding-highspeed": "#9ec4ff",
+  "kimi-code/kimi-for-coding": "#c9ddff",
+};
+// 固定排序：同样按能力从高到低
+const MODEL_ORDER = ["kimi-code/k3", "kimi-code/k3-256k",
+  "kimi-code/kimi-for-coding-highspeed", "kimi-code/kimi-for-coding"];
+// 显示名：对齐 CLI 里的叫法（k2.7 = K2.7 Coding）
+const MODEL_LABEL = {
+  "kimi-code/k3": "k3",
+  "kimi-code/k3-256k": "k3-256k",
+  "kimi-code/kimi-for-coding-highspeed": "k2.7-highspeed",
+  "kimi-code/kimi-for-coding": "k2.7",
+};
+const shortName = m => m === "其他" ? m : (MODEL_LABEL[m] || m.replace(/^kimi-code\//, ""));
 
 function trendLabel(p, kind, long) {
   const dt = new Date(p.t);
@@ -987,7 +1011,7 @@ function modelCostList(el, rows) {
   if (!rows.length) { el.innerHTML = '<span class="empty">暂无数据</span>'; return; }
   const max = Math.max(...rows.map(r => Math.max(r.cost, r.prevCost)), 0.01);
   el.innerHTML = '<div class="mc-legend"><span class="sq1">■</span> 本月 &nbsp; <span class="sq2">■</span> 上月</div>' + rows.map(r => `<div class="bar-row" title="${esc(r.name)}">
-    <span class="name">${esc(r.name)}</span>
+    <span class="name">${esc(shortName(r.name))}</span>
     <span class="track">
       <span class="fill" style="width:${(r.cost / max * 100).toFixed(1)}%"></span>
       <span class="fill prev" style="width:${(r.prevCost / max * 100).toFixed(1)}%"></span>
@@ -1049,10 +1073,20 @@ async function load() {
     for (const p of [...d.hourly, ...d.daily])
       for (const [m, v] of Object.entries(p.models || {})) _sums[m] = (_sums[m] || 0) + v;
     const _top = Object.entries(_sums).sort((a, b) => b[1] - a[1]).map(e => e[0]);
-    TREND.order = _top.slice(0, 4);
+    const _top4 = _top.slice(0, 4);
+    TREND.order = [
+      ...MODEL_ORDER.filter(m => _top4.includes(m)),   // 已知模型按能力排序
+      ..._top4.filter(m => !MODEL_ORDER.includes(m)),  // 未知模型按用量排其后
+    ];
     if (_top.length > 4) TREND.order.push("其他");
     TREND.color = {};
-    TREND.order.forEach((m, i) => TREND.color[m] = TREND_PALETTE[i]);
+    const _free = TREND_PALETTE.slice(0, -1).filter(c => !Object.values(MODEL_COLOR).includes(c));
+    let _fi = 0;
+    TREND.order.forEach(m => {
+      TREND.color[m] = m === "其他" ? TREND_PALETTE[TREND_PALETTE.length - 1]
+        : (MODEL_COLOR[m] || _free[_free.length ? Math.min(_fi++, _free.length - 1) : 0]
+           || TREND_PALETTE[TREND_PALETTE.length - 1]);
+    });
     document.querySelectorAll("#rangeSeg button").forEach(x =>
       x.classList.toggle("on", x.dataset.r === TREND.range));
     placeSegPill();
