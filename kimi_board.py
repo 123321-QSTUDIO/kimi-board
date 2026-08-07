@@ -106,7 +106,7 @@ def detect_plan():
     return result
 
 
-VERSION = "1.3.0"  # 与最新 release 标签（去 v 前缀）保持一致，发版时更新
+VERSION = "1.3.1"  # 与最新 release 标签（去 v 前缀）保持一致，发版时更新
 GITHUB_REPO = "Pierre1231/kimi-board"
 
 _release_cache = {"at": 0.0, "result": None, "checking": False}
