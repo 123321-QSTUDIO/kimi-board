@@ -11,7 +11,7 @@
 [![Release](https://img.shields.io/github/v/release/Pierre1231/kimi-board?style=flat-square)](../../releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2e6fe8?style=flat-square)](LICENSE)
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-2e6fe8?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS-lightgrey?style=flat-square)
 
 ![Kimi Code 用量看板](img_library/Kimi%20Code%20%E7%94%A8%E9%87%8F%E7%9C%8B%E6%9D%BF.png)
 
@@ -38,6 +38,21 @@
      关掉终端窗口不影响运行；停止用 `taskkill /im kimi-board.exe /f`
 3. **推荐：安装浏览器扩展**（见下方 [🧩 浏览器扩展](#-浏览器扩展推荐）)，
    在 Kimi Code WebUI 侧栏实时显示用量，点击直达看板
+
+## 🍎 快速开始（macOS）
+
+1. 按芯片选择下载：Intel 选 `kimi-board-vX.Y.Z-darwin-x64.zip`,
+   M 系列选 `kimi-board-vX.Y.Z-darwin-arm64.zip`，解压到任意位置
+2. 首次运行前在终端执行一次（二进制未签名，需解除浏览器下载附加的隔离标记）:
+
+   ```bash
+   cd 解压目录
+   chmod +x kimi-board start.sh
+   xattr -dr com.apple.quarantine kimi-board start.sh
+   ```
+3. 终端执行 **`./start.sh`**，服务在后台启动并打开看板，
+   关掉终端窗口不影响运行；停止用 `pkill -f kimi-board`
+4. 浏览器扩展同样可用（见下方 [🧩 浏览器扩展](#-浏览器扩展推荐）)
 
 ## 🧩 浏览器扩展（推荐）
 

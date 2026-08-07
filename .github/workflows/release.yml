@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +33,64 @@ jobs:
           $tag = ${env:GITHUB_REF_NAME}
           Compress-Archive -Path "$pkg/*" -DestinationPath "release/kimi-board-$tag-windows-x64.zip"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: release/kimi-board-*-windows-x64.zip
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: macos-13      # Intel
+            arch: x64
+          - runs-on: macos-latest  # Apple Silicon
+            arch: arm64
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build binary
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --name kimi-board --distpath dist --workpath build --specpath build --log-level WARN kimi_board.py
+
+      - name: Package release zip
+        run: |
+          pkg="release/kimi-board"
+          mkdir -p "$pkg"
+          cp dist/kimi-board "$pkg/"
+          cp start.sh README.md LICENSE "$pkg/"
+          cp -r extension "$pkg/"
+          chmod +x "$pkg/kimi-board" "$pkg/start.sh"
+          cd release
+          zip -r "kimi-board-${GITHUB_REF_NAME}-darwin-${{ matrix.arch }}.zip" kimi-board
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-darwin-${{ matrix.arch }}
+          path: release/kimi-board-*-darwin-*.zip
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Release notes from tag annotation
+        run: git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release-body.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/kimi-board-*.zip
+          files: artifacts/**/*.zip
+          body_path: release-body.md
