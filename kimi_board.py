@@ -105,6 +105,68 @@ def detect_plan():
     _plan_cache.update(at=now, result=result)
     return result
 
+
+VERSION = "1.3.0"  # 与最新 release 标签（去 v 前缀）保持一致，发版时更新
+GITHUB_REPO = "Pierre1231/kimi-board"
+
+_release_cache = {"at": 0.0, "result": None, "checking": False}
+
+
+def _ver_tuple(s: str):
+    import re
+
+    parts = [int(x) for x in re.findall(r"\d+", s)[:3]]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def _fetch_latest_release():
+    """经 /releases/latest 重定向取最新标签（网页端点，不消耗 API 配额）。
+    返回 (标签号, release 页 URL)；失败返回 None。"""
+    import re
+    import urllib.request
+
+    try:
+        url = f"https://github.com/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "kimi-board"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            final = resp.geturl()
+        m = re.search(r"/releases/tag/v?([^/]+)$", final)
+        if m:
+            return m.group(1), final
+    except Exception:
+        pass
+    return None
+
+
+def check_update():
+    """返回 {"current", "latest", "url", "newer"}；后台线程异步刷新缓存，
+    请求本身不阻塞。成功缓存 6 小时，失败缓存 10 分钟。"""
+    import threading
+    import time
+
+    now = time.time()
+    cached = _release_cache["result"]
+    ttl = 6 * 3600 if cached and cached["latest"] else 600
+    if _release_cache["at"] and now - _release_cache["at"] < ttl:
+        return cached
+    if not _release_cache["checking"]:
+        _release_cache["checking"] = True
+
+        def _run():
+            try:
+                res = {"current": VERSION, "latest": None, "url": None, "newer": False}
+                r = _fetch_latest_release()
+                if r:
+                    latest, url = r
+                    res.update(latest=latest, url=url,
+                               newer=_ver_tuple(latest) > _ver_tuple(VERSION))
+                _release_cache.update(at=time.time(), result=res)
+            finally:
+                _release_cache["checking"] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+    return cached or {"current": VERSION, "latest": None, "url": None, "newer": False}
+
 # ---------------------------------------------------------------- 数据层
 
 _file_cache = {}  # path -> (mtime, size, [record])
@@ -363,6 +425,11 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   #refresh:hover { background: var(--blue-deep); }
   #refresh:active { transform: scale(.96); }
+  .update-tip {
+    color: var(--blue-deep); text-decoration: none; margin-left: 10px;
+    letter-spacing: inherit;
+  }
+  .update-tip:hover { text-decoration: underline; }
 
   /* ---- 主信息行 ---- */
   .hero { position: relative; margin-bottom: 22px; padding: 2px 0; }
@@ -669,7 +736,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="caption">CHART · 05 TREND</div>
 </section>
 
-<div class="footer reveal" style="animation-delay:200ms"><span class="hex">⬡</span><span id="footMeta">数据来自本机 wire 文件 · 点刷新同步</span></div>
+<div class="footer reveal" style="animation-delay:200ms"><span class="hex">⬡</span><span id="footMeta">数据来自本机 wire 文件 · 点刷新同步</span><a id="updateTip" class="update-tip" hidden target="_blank" rel="noopener"></a></div>
 
 <script>
 /* ---- 动效覆盖:访问 ?motion=on 后,即使系统开了"减少动画"也强制启用动效(存 localStorage);?motion=off 还原 ---- */
@@ -1100,6 +1167,24 @@ async function load() {
 }
 document.getElementById("refresh").onclick = load;
 load();
+
+// 自动检查新版本：有更新时在页头显示 pill，点击直达 release 页
+(async () => {
+  const get = () => fetch("/api/version", {cache: "no-store"}).then(r => r.json());
+  try {
+    let v = await get();
+    if (!v.latest) {  // 后端正在后台查询，稍等再取一次
+      await new Promise(r => setTimeout(r, 9000));
+      v = await get();
+    }
+    if (v.newer && v.url) {
+      const tip = document.getElementById("updateTip");
+      tip.textContent = `· ⬆ v${v.latest} 可更新`;
+      tip.href = v.url;
+      tip.hidden = false;
+    }
+  } catch (e) { /* 离线或接口失败时静默 */ }
+})();
 </script>
 </body>
 </html>
@@ -1115,6 +1200,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", body)
         elif self.path.startswith("/api/stats"):
             body = json.dumps(collect_stats(), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif self.path.startswith("/api/version"):
+            body = json.dumps(check_update(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         else:
             self._send(404, "text/plain", b"not found")
