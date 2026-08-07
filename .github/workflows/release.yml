@@ -43,7 +43,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runs-on: macos-13      # Intel
+          - runs-on: macos-15-intel  # Intel
             arch: x64
           - runs-on: macos-latest  # Apple Silicon
             arch: arm64
