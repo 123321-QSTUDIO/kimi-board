@@ -87,7 +87,9 @@ jobs:
           path: artifacts
 
       - name: Release notes from tag annotation
-        run: git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release-body.md
+        run: |
+          git fetch -f origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release-body.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
