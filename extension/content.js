@@ -121,4 +121,9 @@
 
   refresh();
   setInterval(refresh, 60000);
+
+  // 通知后台：可尝试同步官网月额度（扩展用户已登录 kimi.com 时）
+  if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+    try { chrome.runtime.sendMessage({ type: "kb-sync-subscription" }, () => {}); } catch (e) {}
+  }
 })();

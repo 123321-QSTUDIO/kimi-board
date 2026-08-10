@@ -19,8 +19,8 @@ jobs:
 
       - name: Build exe
         run: |
-          pip install pyinstaller
-          pyinstaller --onefile --name kimi-board --distpath dist --workpath build --specpath build --log-level WARN kimi_board.py
+          pip install pyinstaller pywebview
+          pyinstaller --onefile --name kimi-board --distpath dist --workpath build --specpath build --log-level WARN --hidden-import webview kimi_board.py
 
       - name: Package release zip
         shell: pwsh

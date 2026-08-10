@@ -10,18 +10,40 @@
 wire.jsonl 中 usageScope=="turn" 的 usage.record，含子 agent，不含 session
 级汇总记录（避免重复计数）。
 
+设置：默认从 ~/.kimi-code/kimi-board.json 读取；/settings 网页可视化配置
+（会员档位 / 计费周期起止时分 / 价格来源 / 官方配额），无配置文件时用内置默认。
+
+价格来源：
+  - kimi（默认）：抓 platform.kimi.com/docs/pricing/*.md 官方刊例（元 / 1M）
+  - modelsdev：抓 models.dev/api.json 的 moonshotai 组（USD / 1M，按汇率折元）
+  - manual：仅手动价目 + 内置兜底
+  手动 override（/settings 或配置文件中 pricing.overrides）优先级最高。
+
+官方配额：5 小时限额 / 周限额来自 kimi-code 官方接口——优先走本地
+kimi web 的 GET /api/v1/oauth/usage?provider=managed:kimi-code（server.token 认证），
+失败则直连 https://api.kimi.com/coding/v1/usages（~/.kimi-code/credentials 的
+OAuth token，必要时自动刷新）。窗口 used/limit/reset_at 均取官方数值。
+
 用法：
   python kimi_board.py                      # 默认 127.0.0.1:8321
   python kimi_board.py --port 9000 --plan-price 199 --no-open
+  python kimi_board.py --cycle-day 5 --cycle-hour 9 --cycle-minute 30
+  python kimi_board.py --price-source modelsdev
 """
 
 import argparse
 import calendar
 import json
 import os
+import re
+import secrets
 import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -33,9 +55,10 @@ def kimi_home() -> Path:
 
 USAGE_KEYS = ("inputOther", "inputCacheRead", "inputCacheCreation", "output")
 
-# Kimi 开放平台刊例价（元 / 1M tokens）：(缓存命中, 输入未命中, 输出)
-# https://platform.kimi.com/docs/pricing/chat
-PRICING = {
+# 内置兜底价目（元 / 1M tokens）：(缓存命中, 输入未命中, 输出)。
+# 仅在没有联网、抓取失败且无手动覆盖时使用。
+# https://platform.kimi.com/docs/pricing/chat-k3  ·  /docs/pricing/chat-k27-code
+PRICING_FALLBACK = {
     "kimi-code/k3": (2.0, 20.0, 100.0),                     # kimi-k3
     "kimi-code/k3-256k": (2.0, 20.0, 100.0),                # k3 的 256k 变体，按 k3 价
     "kimi-code/kimi-for-coding-highspeed": (2.6, 13.0, 54.0),  # kimi-k2.7-code-highspeed
@@ -43,12 +66,7 @@ PRICING = {
 }
 DEFAULT_PRICE = (2.0, 20.0, 100.0)
 
-
-def price_of(model: str):
-    """查模型单价；容忍日志里不带 kimi-code/ 前缀的写法。"""
-    return PRICING.get(model) or PRICING.get(f"kimi-code/{model}", DEFAULT_PRICE)
-
-# Kimi 会员档位 -> 月付价格（元）
+# 订阅会员档位 -> 月付价格（元）
 # https://www.kimi.com/zh-cn/resources/kimi-k3-pricing
 PLAN_PRICES = {
     "adagio": 0.0,
@@ -57,10 +75,271 @@ PLAN_PRICES = {
     "allegretto": 199.0,
     "allegro": 699.0,
 }
+DEFAULT_PLAN_PRICE = 199.0
 
-PLAN_PRICE = None  # --plan-price 显式指定时优先于自动识别
+# kimi-code 模型名 -> 官方平台商品名（定价页 / models.dev 里的名字）
+KIMI_MODEL_MAP = {
+    "kimi-code/k3": "kimi-k3",
+    "kimi-code/k3-256k": "kimi-k3",          # k3-256k 与 k3 同模型仅上下文减半，按 k3 计价
+    "kimi-code/kimi-for-coding-highspeed": "kimi-k2.7-code-highspeed",
+    "kimi-code/kimi-for-coding": "kimi-k2.7-code",
+}
+# 官方定价页（Mintlify，加 .md 即 Markdown，价格在 DocTable 的 rows 里）
+KIMI_DOCS_PAGES = (
+    "https://platform.kimi.com/docs/pricing/chat-k3.md",
+    "https://platform.kimi.com/docs/pricing/chat-k27-code.md",
+)
+# models.dev 价格（USD / 1M tokens）：data["moonshotai"]["models"][id]["cost"]
+# cost = { "cache_read": 缓存命中, "input": 输入未命中, "output": 输出 }
+MODELS_DEV_URL = "https://models.dev/api.json"
+MODELS_DEV_PROVIDER = "moonshotai"
+# 汇率接口（免 key），失败时回退到配置里的 usdCny 或 7.25
+FX_RATE_URL = "https://open.er-api.com/v6/latest/USD"
+DEFAULT_USD_CNY = 7.25
+
+# 官方配额接口
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
+KIMI_OAUTH_HOST = "https://auth.kimi.com"
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+
+# ---------------------------------------------------------------- 配置文件
+
+CONFIG_FILE = "kimi-board.json"      # 位于 kimi_home() 下，网页设置页读写
+CACHE_FILE = "kimi-board-cache.json"  # 价格/配额抓取结果的离线快照
+
+
+def default_config() -> dict:
+    return {
+        "version": 1,
+        "plan": {"auto": True, "tier": "", "price": None},
+        "billing": {"day": 1, "hour": 0, "minute": 0},
+        "pricing": {"source": "kimi", "usdCny": None, "overrides": {}, "k3half": False},
+        "quota": {"enabled": True, "source": "auto"},
+        "subscription": {"enabled": True, "source": "auto", "persistToken": False},
+    }
+
+
+def config_path() -> Path:
+    return kimi_home() / CONFIG_FILE
+
+
+def cache_path() -> Path:
+    return kimi_home() / CACHE_FILE
+
+
+def _merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config() -> dict:
+    p = config_path()
+    if p.is_file():
+        try:
+            return _merge(default_config(), json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return default_config()
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        home = kimi_home()
+        home.mkdir(parents=True, exist_ok=True)
+        config_path().write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def load_cache() -> dict:
+    p = cache_path()
+    if p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_cache(data: dict) -> None:
+    try:
+        home = kimi_home()
+        home.mkdir(parents=True, exist_ok=True)
+        cache_path().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+CFG = default_config()  # 运行时配置（配置文件 + CLI 覆盖合并后的结果）
+SERVER_PORT = 8321       # 当前监听端口
+_connect_queue = None    # "连接 Kimi" 命令队列，由主线程消费并开 WebView
+
+# ---- 本地接口防护：每次运行生成随机 secret，用于非白名单来源的写操作 ----
+_local_secret = secrets.token_hex(16)
+# 允许的本地来源（kimi web UI 端口段）——浏览器里恶意网页无法伪造 Origin
+_LOCAL_ORIGIN_RE = re.compile(
+    r"^http://(127\.0\.0\.1|localhost):(5862[7-9]|5863[0-9])$")
+_manual_token = ""     # 手动 Token 只在内存；不回写配置文件
+_sub_persist = False   # 是否已把 Token 存进系统凭据库（Windows）
+_CRED_TARGET = "KimiBoard/KimiWebToken"
+
+
+# ---------------------------------------------------------------- 价格
+
+_PRICE_TABLE = dict(PRICING_FALLBACK)
+_PRICE_META = {
+    "source": "fallback", "currency": "CNY", "fetchedAt": 0,
+    "ok": False, "message": "内置兜底价目（未联网抓取）",
+}
+_pricing_lock = threading.Lock()
+_pricing_fetching = {"at": 0.0, "busy": False, "done": False}
+
+_FX = {"rate": DEFAULT_USD_CNY, "at": 0.0}
+_fx_lock = threading.Lock()
+
+
+def _http_json(url: str, headers=None, timeout=8):
+    req = urllib.request.Request(url, headers=headers or {})
+    req.add_header("User-Agent", "kimi-board")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _parse_cny(text: str):
+    """从官方定价页 Markdown 的 DocTable rows 里解析出 {平台模型名: (命中, 未命中, 输出)}。"""
+    prices = {}
+    for block in re.findall(r"rows=\{\[([\s\S]*?)\]\}", text):
+        for row in re.findall(r"\[([\s\S]*?)\]", block):
+            cells = re.findall(r'"([^"]*)"', row)
+            if len(cells) < 5:
+                continue
+            num = []
+            ok = True
+            for cell in cells[2:5]:
+                m = re.match(r"¥?\s*([\d.]+)", cell.strip())
+                if not m:
+                    ok = False
+                    break
+                num.append(float(m.group(1)))
+            if ok:
+                prices[cells[0]] = tuple(num)
+    return prices
+
+
+def fetch_kimi_docs_prices() -> tuple:
+    """官方刊例价（元 / 1M）。返回 (model->(hit,miss,out), ok)。"""
+    table = {}
+    for url in KIMI_DOCS_PAGES:
+        try:
+            text = urllib.request.urlopen(
+                urllib.request.Request(url, headers={"User-Agent": "kimi-board"}), timeout=10
+            ).read().decode("utf-8", errors="replace")
+            table.update(_parse_cny(text))
+        except Exception:
+            continue
+    return table, bool(table)
+
+
+def fetch_modelsdev_prices() -> tuple:
+    """models.dev 价格（USD / 1M）。返回 (model->(hit,miss,out), ok)。"""
+    try:
+        data = _http_json(MODELS_DEV_URL, timeout=10)
+        models = (data.get(MODELS_DEV_PROVIDER) or {}).get("models") or {}
+        table = {}
+        for code_model, plat in KIMI_MODEL_MAP.items():
+            cost = (models.get(plat) or {}).get("cost") or {}
+            hit, miss, out = (
+                cost.get("cache_read"), cost.get("input"), cost.get("output"),
+            )
+            if miss is None or out is None:
+                continue
+            if hit is None:  # 无缓存价时按未命中价兜底（保守）
+                hit = miss
+            table[code_model] = (float(hit), float(miss), float(out))
+        return table, bool(table)
+    except Exception:
+        return {}, False
+
+
+def _fetch_fx_rate() -> float:
+    """USD->CNY 汇率，来自 open.er-api.com，失败返回 None。"""
+    try:
+        data = _http_json(FX_RATE_URL, timeout=6)
+        rate = ((data.get("rates") or {}).get("CNY"))
+        if isinstance(rate, (int, float)) and rate > 0:
+            return float(rate)
+    except Exception:
+        pass
+    return None
+
+
+def usd_cny_rate(cfg: dict) -> tuple:
+    """返回 (rate, source)。配置里显式指定优先，否则自动抓取（带缓存）。"""
+    manual = cfg["pricing"].get("usdCny")
+    if manual:
+        return float(manual), "manual"
+    now = time.time()
+    with _fx_lock:
+        if _FX["at"] and now - _FX["at"] < 6 * 3600:
+            return _FX["rate"], "auto"
+    rate = _fetch_fx_rate()
+    with _fx_lock:
+        if rate:
+            _FX.update(rate=rate, at=now)
+            return rate, "auto"
+        return _FX["rate"], "auto" if _FX["at"] else "default"
+
 
 _plan_cache = {"at": 0.0, "result": None}
+
+
+def kimi_instances():
+    """读 kimi_home()/server/instances/*.json，按心跳时间倒序返回最近的实例。"""
+    instances = []
+    for p in (kimi_home() / "server" / "instances").glob("*.json"):
+        try:
+            instances.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    instances.sort(key=lambda i: -(i.get("heartbeat_at") or 0))
+    return instances
+
+
+def kimi_server_token() -> str:
+    return (kimi_home() / "server.token").read_text(encoding="utf-8").strip()
+
+
+def _kimi_local_call(inst, path: str, params: str = "", timeout=2.0):
+    """对本地 kimi web 实例发 Bearer 请求，成功返回 data（信封内的业务数据）。"""
+    token = kimi_server_token()
+    url = f"http://{inst.get('host', '127.0.0.1')}:{inst['port']}{path}"
+    if params:
+        url += "?" + urllib.parse.quote(params, safe="=")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read())
+    return data.get("data")
+
+
+def _kimi_local_any(path: str, params: str = "", timeout=2.0):
+    """遍历本地实例，返回第一个成功的结果。"""
+    for inst in kimi_instances()[:3]:
+        try:
+            result = _kimi_local_call(inst, path, params, timeout)
+            if result is not None:
+                return result
+        except Exception:
+            continue
+    return None
 
 
 def detect_plan():
@@ -70,43 +349,796 @@ def detect_plan():
     用 server.token 作为 bearer 调 /api/v1/oauth/userinfo 拿 userLevelName。
     成功结果缓存 10 分钟；失败只缓存 30 秒（避免 WebUI 短暂掉线后长时间回退默认价）。
     """
-    import time
-    import urllib.request
-
     now = time.time()
     ttl = 600 if _plan_cache["result"] else 30
     if _plan_cache["at"] and now - _plan_cache["at"] < ttl:
         return _plan_cache["result"]
     result = None
     try:
-        token = (kimi_home() / "server.token").read_text(encoding="utf-8").strip()
-        instances = []
-        for p in (kimi_home() / "server" / "instances").glob("*.json"):
-            try:
-                instances.append(json.loads(p.read_text(encoding="utf-8")))
-            except Exception:
-                pass
-        instances.sort(key=lambda i: -i.get("heartbeat_at", 0))
-        for inst in instances[:3]:
-            try:
-                url = f"http://{inst.get('host', '127.0.0.1')}:{inst['port']}/api/v1/oauth/userinfo"
-                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-                with urllib.request.urlopen(req, timeout=1.5) as resp:
-                    data = json.loads(resp.read())
-                name = ((data.get("data") or {}).get("userInfo") or {}).get("userLevelName")
-                price = PLAN_PRICES.get(name.lower()) if name else None
-                if price is not None:
-                    result = (price, name)
-                    break
-            except Exception:
-                continue
+        data = _kimi_local_any("/api/v1/oauth/userinfo")
+        name = ((data or {}).get("userInfo") or {}).get("userLevelName")
+        price = PLAN_PRICES.get(name.lower()) if name else None
+        if price is not None:
+            result = (price, name)
     except Exception:
         pass
     _plan_cache.update(at=now, result=result)
     return result
 
 
-VERSION = "1.3.2"  # 与最新 release 标签（去 v 前缀）保持一致，发版时更新
+def resolve_plan(cfg: dict):
+    """合并配置文件 + 自动识别的会员档位，返回 (价格, 档位名, 是否自动, 来源说明)。
+
+    优先级：config.plan.price 显式价 > config.plan.tier 档位价 > 自动识别 > 默认价。
+    """
+    plan = cfg["plan"]
+    if plan.get("price") is not None:
+        return float(plan["price"]), None, False, "custom"
+    if plan.get("tier"):
+        name = plan["tier"]
+        return PLAN_PRICES.get(name, DEFAULT_PLAN_PRICE), name, False, "tier"
+    if plan.get("auto"):
+        auto = detect_plan()
+        if auto:
+            return auto[0], auto[1], True, "auto"
+    return DEFAULT_PLAN_PRICE, None, False, "default"
+
+
+# ---------------------------------------------------------------- 价格解析 & 配额
+
+_PRICE_FETCH_TTL = 6 * 3600   # 成功 6h
+_PRICE_FAIL_TTL = 600          # 失败 10min
+
+
+def _raw_fetch(source: str, cfg: dict) -> tuple:
+    """抓取来源价目表（元 / 1M）。返回 (table, meta)。"""
+    if source == "modelsdev":
+        table, ok = fetch_modelsdev_prices()
+        if ok:
+            rate, rate_src = usd_cny_rate(cfg)
+            table = {m: tuple(v * rate for v in vals) for m, vals in table.items()}
+            return table, {
+                "ok": True, "currency": "CNY", "fetchedAt": int(time.time() * 1000),
+                "message": f"models.dev (USD×{rate:.2f}, {rate_src})",
+            }
+        return {}, {"ok": False, "currency": "CNY", "fetchedAt": 0,
+                    "message": "models.dev 抓取失败，回退内置价目"}
+    # kimi 官方刊例
+    table, ok = fetch_kimi_docs_prices()
+    if ok:
+        return table, {
+            "ok": True, "currency": "CNY", "fetchedAt": int(time.time() * 1000),
+            "message": "platform.kimi.com 官方刊例",
+        }
+    return {}, {"ok": False, "currency": "CNY", "fetchedAt": 0,
+                "message": "官方定价页抓取失败，回退内置价目"}
+
+
+def _to_code_names(table: dict) -> dict:
+    """把价目表键统一为 kimi-code 模型名（兼容平台名 kimi-k3 等）。"""
+    rev = {}
+    for code_m, plat in KIMI_MODEL_MAP.items():
+        rev.setdefault(plat, code_m)
+    out = {}
+    for k, v in table.items():
+        if k in KIMI_MODEL_MAP:
+            out[k] = v
+        elif k in rev:
+            out[rev[k]] = v
+    return out
+
+
+def _build_price_table(raw: dict, cfg: dict) -> dict:
+    """由抓取结果(raw)+配置生成最终生效价目表。
+
+    优先级：手动 override > 抓取结果 > 内置兜底；
+    开启 k3half 时，kimi-code/k3-256k 一律按 k3 生效价的 50% 计算。
+    """
+    table = {}
+    overrides = cfg["pricing"].get("overrides") or {}
+    for model, fb in PRICING_FALLBACK.items():
+        if model in overrides:
+            table[model] = tuple(float(x) for x in overrides[model])
+        elif model in raw:
+            table[model] = raw[model]
+        else:
+            table[model] = fb
+    for m, v in overrides.items():
+        if m not in PRICING_FALLBACK:  # 自定义模型
+            table[m] = tuple(float(x) for x in v)
+    if cfg["pricing"].get("k3half") and "kimi-code/k3" in table:
+        table["kimi-code/k3-256k"] = tuple(v * 0.5 for v in table["kimi-code/k3"])
+    return table
+
+
+def _seed_price_cache() -> None:
+    """启动时用上次抓取快照预填价目，保证首屏即有正确价格。"""
+    global _PRICE_TABLE, _PRICE_META
+    prices = (load_cache().get("prices") or {})
+    table = prices.get("table")
+    if isinstance(table, dict) and table:
+        cleaned = {}
+        for k, v in table.items():
+            if isinstance(v, (list, tuple)) and len(v) >= 3:
+                try:
+                    cleaned[k] = (float(v[0]), float(v[1]), float(v[2]))
+                except (TypeError, ValueError):
+                    continue
+        cleaned = _to_code_names(cleaned)
+        if cleaned:
+            _PRICE_TABLE = _build_price_table(cleaned, CFG)
+            meta = dict(prices.get("meta") or {})
+            meta.update(source=prices.get("source", "cache"),
+                        message=(meta.get("message") or "") + "（上次快照，正在同步…）")
+            _PRICE_META = meta
+
+
+def refresh_pricing(force=False) -> None:
+    """重建全局 _PRICE_TABLE / _PRICE_META（并发安全，重复请求合并）。"""
+    global _PRICE_TABLE, _PRICE_META
+    cfg = CFG
+    now = time.time()
+    with _pricing_lock:
+        if not force and _pricing_fetching["done"] and \
+                (now - _pricing_fetching["at"]) < (_PRICE_FETCH_TTL if _PRICE_META["ok"] else _PRICE_FAIL_TTL):
+            return
+        if _pricing_fetching["busy"]:
+            # 等待正在进行的抓取完成（最多 8s），避免首屏用兜底价
+            deadline = now + 8
+            while _pricing_fetching["busy"] and time.time() < deadline:
+                time.sleep(0.1)
+            return
+        _pricing_fetching["busy"] = True
+
+    table, raw, meta = {}, {}, {"ok": False, "currency": "CNY", "fetchedAt": 0, "message": ""}
+    try:
+        source = cfg["pricing"]["source"]
+        if source != "manual":
+            raw, meta = _raw_fetch(source, cfg)
+            if not raw:
+                # 离线回退：使用上次抓取成功的快照
+                cached = (load_cache().get("prices") or {})
+                if cached.get("source") == source and isinstance(cached.get("table"), dict):
+                    raw = cached["table"]
+                    meta = dict(cached.get("meta") or {}, message=meta["message"] + "（离线用上次快照）")
+            # 快照落盘，离线可用（存原始平台名版本，加载时统一转换）
+            cache = load_cache()
+            cache.setdefault("prices", {}).update(
+                source=source, table=raw, meta=meta, savedAt=int(time.time() * 1000))
+            save_cache(cache)
+        else:
+            meta = {"ok": False, "currency": "CNY", "fetchedAt": 0,
+                    "message": "手动价目模式（仅内置 + override）"}
+        meta = dict(meta, source=source)
+        raw = _to_code_names(raw)
+        table = _build_price_table(raw, cfg)
+        if not meta["ok"] and (cfg["pricing"].get("overrides") or {}):
+            meta["message"] = "手动 override 生效，其余模型使用内置价目"
+    finally:
+        _PRICE_TABLE = table
+        _PRICE_META = meta
+        with _pricing_lock:
+            _pricing_fetching.update(at=now, busy=False, done=True)
+
+
+def price_of(model: str):
+    """查模型单价；容忍日志里不带 kimi-code/ 前缀的写法。"""
+    return (_PRICE_TABLE.get(model)
+            or _PRICE_TABLE.get(f"kimi-code/{model}")
+            or DEFAULT_PRICE)
+
+
+def pricing_info() -> dict:
+    return dict(_PRICE_META, table={m: list(v) for m, v in _PRICE_TABLE.items()})
+
+
+# ---- 官方配额：5 小时 / 周 限额 ----
+
+_quota_cache = {"at": 0.0, "data": None, "busy": False}
+_quota_lock = threading.Lock()
+_QUOTA_TTL = 30.0  # 配额数据 30 秒内视为新鲜
+
+
+def _to_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_reset_at(v):
+    if not isinstance(v, str) or not v:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(v, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _normalize_rows(rows: list) -> list:
+    """把 (name, window(duration,unit), used, limit, resetAt) 归一成统一结构。"""
+    out = []
+    for name, window, used, limit, reset_at in rows:
+        if limit <= 0:
+            continue
+        row = {"name": name, "window": window, "used": used, "limit": limit,
+               "resetAt": reset_at, "pct": round(used / limit * 100, 1)}
+        # 推算：以窗口内平均速率估计到达限额的时间
+        window_sec = None
+        if window and window[1] == "hour":
+            window_sec = window[0] * 3600
+        elif window and window[1] == "week":
+            window_sec = window[0] * 7 * 86400
+        dt = _parse_reset_at(reset_at)
+        if window_sec and dt:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            remaining = (dt - datetime.now().astimezone()).total_seconds()
+            elapsed = max(1.0, window_sec - remaining)
+            rate = used / elapsed
+            if rate > 0:
+                row["etaSeconds"] = int((limit - used) / rate)
+            else:
+                row["etaSeconds"] = None
+        out.append(row)
+    return out
+
+
+def fetch_quota_local() -> tuple:
+    """本地 kimi web：GET /api/v1/oauth/usage?provider=managed:kimi-code。"""
+    data = _kimi_local_any(
+        "/api/v1/oauth/usage",
+        params="provider=managed:kimi-code",
+        timeout=2.5,
+    )
+    if not data:
+        return None, "本地 kimi web 未运行或接口不可用"
+    rows = []
+    summary = data.get("summary")
+    if summary:
+        w = summary.get("window") or {}
+        rows.append((summary.get("name", "Weekly limit"), (w.get("duration", 1), w.get("unit", "week")),
+                     _to_int(summary.get("used")), _to_int(summary.get("limit")), summary.get("reset_at")))
+    for lim in data.get("limits") or []:
+        w = lim.get("window") or {}
+        name = lim.get("name")
+        if not name:
+            name = {("hour", 5): "5h limit", ("hour", 24): "24h limit",
+                    ("minute", 300): "5h limit", ("day", 7): "Weekly limit"}.get(
+                        (w.get("unit"), w.get("duration")), "limit")
+        rows.append((name, (w.get("duration", 1), w.get("unit", "")),
+                     _to_int(lim.get("used")), _to_int(lim.get("limit")), lim.get("reset_at")))
+    return _normalize_rows(rows), None
+
+
+def _cloud_access_token() -> tuple:
+    """读 OAuth credentials，必要时刷新，返回 (token, error)。"""
+    cred = kimi_home() / "credentials" / "kimi-code.json"
+    if not cred.is_file():
+        return None, "未找到 ~/.kimi-code/credentials/kimi-code.json（请先 kimi login）"
+    try:
+        info = json.loads(cred.read_text(encoding="utf-8"))
+    except Exception:
+        return None, "credentials 文件损坏"
+    now = time.time()
+    if _to_int(info.get("expires_at")) > now + 60:
+        return info.get("access_token"), None
+    # 需要刷新
+    refresh_token = info.get("refresh_token")
+    if not refresh_token:
+        return None, "OAuth token 已过期且无 refresh_token"
+    body = urllib.parse.urlencode({
+        "client_id": KIMI_OAUTH_CLIENT_ID,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{KIMI_OAUTH_HOST}/api/oauth/token", data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read())
+        access = payload.get("access_token")
+        if not access:
+            return None, "OAuth 刷新失败：响应缺少 access_token"
+        info["access_token"] = access
+        info["refresh_token"] = payload.get("refresh_token", refresh_token)
+        info["expires_at"] = int(time.time()) + _to_int(payload.get("expires_in"), 3600)
+        try:
+            cred.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        return access, None
+    except Exception as e:
+        return None, f"OAuth 刷新失败：{e}"
+
+
+def fetch_quota_cloud() -> tuple:
+    """云端直连：GET {KIMI_CODE_BASE_URL}/usages。"""
+    token, err = _cloud_access_token()
+    if not token:
+        return None, err
+    try:
+        payload = _http_json(f"{KIMI_CODE_BASE_URL}/usages",
+                             headers={"Authorization": f"Bearer {token}"}, timeout=8)
+    except Exception as e:
+        return None, f"云端配额接口请求失败：{e}"
+    rows = []
+    usage = payload.get("usage")
+    if usage:
+        rows.append(("Weekly limit", (1, "week"),
+                     _to_int(usage.get("used")), _to_int(usage.get("limit")), usage.get("resetTime")))
+    unit_map = {"TIME_UNIT_MINUTE": "minute", "TIME_UNIT_HOUR": "hour",
+                "TIME_UNIT_DAY": "day", "TIME_UNIT_WEEK": "week"}
+    for lim in payload.get("limits") or []:
+        w = lim.get("window") or {}
+        unit = unit_map.get(w.get("timeUnit"), "minute")
+        dur = _to_int(w.get("duration"))
+        if unit == "minute" and dur >= 60 and dur % 60 == 0:
+            unit, dur = "hour", dur // 60
+        name = lim.get("name") or {("hour", 5): "5h limit", ("hour", 24): "24h limit",
+                                   ("week", 1): "Weekly limit"}.get((unit, dur), "limit")
+        d = lim.get("detail") or {}
+        rows.append((name, (dur, unit), _to_int(d.get("used")), _to_int(d.get("limit")),
+                     d.get("resetTime")))
+    return _normalize_rows(rows), None
+
+
+def fetch_quota(cfg: dict, force=False) -> dict:
+    """按配置同步官方配额。优先本地，再云端。结果 30s 缓存。"""
+    now = time.time()
+    with _quota_lock:
+        if not force and _quota_cache["data"] is not None and now - _quota_cache["at"] < _QUOTA_TTL:
+            return _quota_cache["data"]
+        if _quota_cache["busy"]:
+            return _quota_cache["data"] or {"ok": False, "message": "同步中…", "rows": []}
+        _quota_cache["busy"] = True
+    result = None
+    try:
+        source_cfg = cfg["quota"].get("source", "auto")
+        rows, err, used_source = None, None, None
+        if source_cfg in ("auto", "local"):
+            rows, err = fetch_quota_local()
+            if rows is not None:
+                used_source = "local"
+        if rows is None and source_cfg in ("auto", "cloud"):
+            rows, err = fetch_quota_cloud()
+            if rows is not None:
+                used_source = "cloud"
+        if rows is not None:
+            result = {"ok": True, "message": None, "source": used_source,
+                      "fetchedAt": int(now * 1000), "rows": rows}
+        else:
+            # 离线回退：使用上次抓取成功的快照
+            cached = (load_cache().get("quota") or {})
+            if cached.get("ok") and isinstance(cached.get("rows"), list):
+                result = dict(cached, source=used_source or source_cfg,
+                              message="离线快照（当前无法联网同步）",
+                              fetchedAt=cached.get("fetchedAt", int(now * 1000)))
+            else:
+                result = {"ok": False, "message": err or "配额接口不可用",
+                          "source": source_cfg, "fetchedAt": int(now * 1000), "rows": []}
+        cache = load_cache()
+        cache["quota"] = result
+        save_cache(cache)
+    finally:
+        with _quota_lock:
+            _quota_cache.update(at=now, data=result, busy=False)
+    return result
+
+
+def quota_snapshot(cfg: dict, force=False) -> dict:
+    """供 /api/stats 与 /api/quota 使用：未启用则返回禁用态。"""
+    if not cfg["quota"].get("enabled", True):
+        return {"ok": False, "enabled": False, "message": "配额同步已关闭", "rows": [], "fetchedAt": 0}
+    data = fetch_quota(cfg, force=force)
+    data = dict(data, enabled=True)
+    if data.get("ok") and not force:
+        # 复用快照，若缓存新鲜则原样返回
+        return data
+    return data
+
+
+# ---- 月额度（官网 GetSubscriptionStats）----
+# 独立 adapter：KimiWebProvider → normalize_subscription → Board。
+# 后端只保存归一化结果（比例 / 重置时间 / 提示），绝不保存 JWT/Cookie。
+# 来源三选一：
+#   auto   = 内置 WebView / 浏览器扩展把官网数据推来（POST /api/subscription）
+#   manual = 设置页粘贴官网 JWT（高级/救援），看板自己调 GetSubscriptionStats
+SUBSTATS_URL = "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
+SUBSTATS_MANUAL_HEADERS = {
+    "Content-Type": "application/json",
+    "Origin": "https://www.kimi.com",
+    "Referer": "https://www.kimi.com/membership/subscription?tab=quota",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "x-msh-platform": "web",
+    "x-msh-version": "2.0.0",
+}
+_websub = {"at": 0.0, "data": None}  # 内存态，webview/extension 推送后更新（已归一化）
+
+
+def _http_post_json(url: str, body: bytes, headers=None, timeout=8):
+    req = urllib.request.Request(url, data=body, headers=headers or {}, method="POST")
+    req.add_header("User-Agent", "kimi-board")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def _fnum(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_subscription(raw):
+    """KimiWebProvider → Board：只抽取需要的字段，丢弃其余一切（含可能的用户 ID）。"""
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not (
+            payload.get("subscriptionBalance") or payload.get("ratelimitCode5h")):
+        return None
+    sub = payload.get("subscriptionBalance") or {}
+    r5 = payload.get("ratelimitCode5h") or {}
+    r7 = payload.get("ratelimitCode7d") or {}
+    notice = payload.get("notice") or {}
+    user = payload.get("user") or {}
+    return {
+        "amountUsedRatio": _fnum(sub.get("amountUsedRatio")),
+        "kimiCodeUsedRatio": _fnum(sub.get("kimiCodeUsedRatio")),
+        "expireTime": sub.get("expireTime"),
+        "planLevel": (user.get("membership") or {}).get("level"),
+        "limits5h": {
+            "ratio": _fnum(r5.get("ratio")),
+            "enabled": bool(r5.get("enabled", True)),
+            "resetTime": r5.get("resetTime"),
+        },
+        "limits7d": {
+            "ratio": _fnum(r7.get("ratio")),
+            "enabled": bool(r7.get("enabled", True)),
+            "resetTime": r7.get("resetTime"),
+        },
+        "notice": {
+            "tip": notice.get("tip"),
+            "content": notice.get("content"),
+            "resetTime": notice.get("resetTime"),
+        },
+    }
+
+
+# ---- Windows 凭据库（ctypes 直调 Credential Manager，零依赖）----
+
+_CRED_TYPE_GENERIC = 1
+_CRED_PERSIST_LOCAL_MACHINE = 2
+
+
+def _win_cred_write(target: str, value: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDW(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+                ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+                ("LastWritten", wintypes.FILETIME), ("CredentialBlobSize", wintypes.DWORD),
+                ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)), ("Persist", wintypes.DWORD),
+                ("AttributeCount", wintypes.DWORD), ("Attributes", ctypes.c_void_p),
+                ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR),
+            ]
+
+        blob = value.encode("utf-16-le")
+        buf = ctypes.create_string_buffer(blob)
+        cred = CREDW()
+        cred.Type = _CRED_TYPE_GENERIC
+        cred.TargetName = target
+        cred.CredentialBlobSize = len(blob)
+        cred.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))
+        cred.Persist = _CRED_PERSIST_LOCAL_MACHINE
+        return bool(ctypes.windll.advapi32.CredWriteW(ctypes.byref(cred), 0))
+    except Exception:
+        return False
+
+
+def _win_cred_read(target: str):
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDW(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+                ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+                ("LastWritten", wintypes.FILETIME), ("CredentialBlobSize", wintypes.DWORD),
+                ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)), ("Persist", wintypes.DWORD),
+                ("AttributeCount", wintypes.DWORD), ("Attributes", ctypes.c_void_p),
+                ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR),
+            ]
+
+        cred = ctypes.c_void_p()
+        if not ctypes.windll.advapi32.CredReadW(target, _CRED_TYPE_GENERIC, 0, ctypes.byref(cred)):
+            return None
+        try:
+            p = ctypes.cast(cred, ctypes.POINTER(CREDW)).contents
+            return ctypes.string_at(p.CredentialBlob, p.CredentialBlobSize).decode("utf-16-le")
+        finally:
+            ctypes.windll.advapi32.CredFree(cred)
+    except Exception:
+        return None
+
+
+def _win_cred_delete(target: str) -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.advapi32.CredDeleteW(target, _CRED_TYPE_GENERIC, 0)
+    except Exception:
+        pass
+
+
+def set_manual_token(token: str, persist: bool) -> None:
+    """手动 Token 只在内存；仅当 persist 时写入系统凭据库，从不写配置文件。"""
+    global _manual_token, _sub_persist
+    _manual_token = (token or "").strip().lstrip("\ufeff")
+    _sub_persist = bool(persist)
+    if _manual_token and persist:
+        _win_cred_write(_CRED_TARGET, _manual_token)
+    elif not _manual_token:
+        _win_cred_delete(_CRED_TARGET)
+        _sub_persist = False
+
+
+def get_manual_token(cfg: dict):
+    """取手动 Token：内存优先，其次系统凭据库。"""
+    global _manual_token
+    if _manual_token:
+        return _manual_token
+    if (cfg.get("subscription") or {}).get("persistToken"):
+        tok = _win_cred_read(_CRED_TARGET)
+        if tok:
+            _manual_token = tok
+            return tok
+    return None
+
+
+def fetch_subscription_manual(cfg: dict) -> tuple:
+    """Provider：用官网 JWT 直接请求 GetSubscriptionStats，返回归一化结果。"""
+    token = get_manual_token(cfg)
+    if not token:
+        return None, "未设置官网 Token（高级/救援模式需在设置页粘贴）"
+    headers = dict(SUBSTATS_MANUAL_HEADERS, Authorization="Bearer " + token)
+    try:
+        payload = _http_post_json(SUBSTATS_URL, b"{}", headers)
+    except Exception as e:
+        return None, f"请求失败：{e}"
+    norm = normalize_subscription(payload)
+    if norm is None:
+        return None, "返回结构不是 GetSubscriptionStats（接口可能已改版，请更新看板）"
+    return norm, None
+
+
+def handle_subscription_post(raw, source: str) -> dict:
+    """WebView / 扩展推送：归一化后仅存结果，不碰凭据。"""
+    norm = normalize_subscription(raw)
+    if norm is None:
+        return {"ok": False, "error": "不是 GetSubscriptionStats 的返回结构"}
+    cache = load_cache()
+    cache["subscription"] = {
+        "data": norm, "fetchedAt": int(time.time() * 1000), "source": source,
+    }
+    save_cache(cache)
+    _websub.update(at=time.time(), data=cache["subscription"])
+    return {"ok": True}
+
+
+def _load_websub():
+    if _websub["data"] is None:
+        cache = load_cache()
+        cached = cache.get("subscription") or {}
+        if cached.get("data"):
+            _websub.update(at=0.0, data=cached)
+    return _websub["data"]
+
+
+def subscription_snapshot(cfg: dict, force=False) -> dict:
+    """返回月额度信息：{ok, enabled, source, fetchedAt, data, message}。"""
+    sub = cfg.get("subscription") or {}
+    if not sub.get("enabled", True):
+        return {"ok": False, "enabled": False, "message": "月额度同步已关闭", "data": None}
+    if sub.get("source") == "manual" and get_manual_token(cfg):
+        cached = _load_websub()
+        fresh = cached and (time.time() - cached.get("fetchedAt", 0) / 1000) < 300
+        if force or not fresh:
+            norm, err = fetch_subscription_manual(cfg)
+            if norm:
+                cached = {"data": norm, "fetchedAt": int(time.time() * 1000), "source": "manual"}
+                cache = load_cache(); cache["subscription"] = cached; save_cache(cache)
+                _websub.update(at=time.time(), data=cached)
+            elif not fresh and cached:
+                cached = dict(cached, message="手动同步失败：" + (err or ""))
+    else:
+        cached = _load_websub()
+    if not cached or not cached.get("data"):
+        return {"ok": False, "enabled": True,
+                "message": "尚无月额度数据：在设置页「连接 Kimi」登录，或安装浏览器扩展自动同步",
+                "data": None}
+    return {"ok": True, "enabled": True,
+            "source": cached.get("source", "auto"),
+            "fetchedAt": cached.get("fetchedAt", 0),
+            "message": cached.get("message") or "",
+            "data": cached.get("data")}
+
+
+def run_connect_webview(port: int) -> None:
+    """在主线程内运行：用 pywebview 开登录窗口，登录成功后把月额度存进看板。"""
+    import time as _t
+    try:
+        import webview
+    except ImportError:
+        return
+    probe = """(function(){
+      if (window.__kb_sub) return JSON.stringify(window.__kb_sub);
+      (async function(){
+        try {
+          var r = await fetch('%s', {method:'POST',
+            headers:{'Content-Type':'application/json'}, body:'{}', credentials:'include'});
+          window.__kb_sub = r.ok ? {ok:true, data:await r.text()} : {ok:false, status:r.status};
+        } catch(e){ window.__kb_sub = {ok:false, err:String(e)}; }
+      })();
+      return null;
+    })()""" % SUBSTATS_URL
+    state = {"done": False, "data": None}
+
+    def _loop(window):
+        while not state["done"]:
+            try:
+                res = window.evaluate_js(probe)
+                if isinstance(res, str):
+                    try:
+                        obj = json.loads(res)
+                    except Exception:
+                        obj = None
+                    if obj and obj.get("ok") and obj.get("data"):
+                        state.update(done=True, data=obj["data"])
+                        try:
+                            window.destroy()
+                        except Exception:
+                            pass
+                        return
+            except Exception:
+                pass
+            _t.sleep(3)
+
+    window = webview.create_window(
+        "Kimi Board · 登录 Kimi（月额度）",
+        "https://www.kimi.com/membership/subscription?tab=quota",
+        width=920, height=760, min_size=(760, 600),
+    )
+    webview.start(_loop, window)
+    if state.get("data"):
+        handle_subscription_post(state["data"], "webview")
+
+
+def run_logout_webview() -> None:
+    """清除 WebView 里 kimi.com 的登录态（localStorage/sessionStorage/cookies）。"""
+    import time as _t
+    try:
+        import webview
+    except ImportError:
+        return
+    clear_js = """(function(){
+      try { localStorage.clear(); sessionStorage.clear(); } catch(e){}
+      try {
+        document.cookie.split(';').forEach(function(c){
+          var n = c.split('=')[0].trim();
+          if (n) {
+            document.cookie = n + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.kimi.com';
+            document.cookie = n + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
+          }
+        });
+      } catch(e){}
+      return 'cleared';
+    })()"""
+    window = webview.create_window(
+        "Kimi Board · 清除 Kimi 登录数据",
+        "https://www.kimi.com", width=680, height=480,
+    )
+
+    def _do(window):
+        try:
+            window.evaluate_js(clear_js)
+        except Exception:
+            pass
+        _t.sleep(1)
+        try:
+            webview.delete_cookie("www.kimi.com")
+            webview.delete_cookie(".kimi.com")
+        except Exception:
+            pass
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    webview.start(_do, window)
+
+
+def clear_kimi_login() -> None:
+    """清除 Kimi 登录数据：清看板缓存 + 由主线程跑 WebView 清 kimi.com 登录态。"""
+    _websub.update(data=None)
+    cache = load_cache()
+    cache.pop("subscription", None)
+    save_cache(cache)
+    try:
+        _connect_queue.put_nowait("logout")
+        return {"ok": True, "message": "已清除看板缓存，正在清除 WebView 登录态…"}
+    except Exception:
+        return {"ok": False, "message": "清除失败"}
+
+
+def webview_available() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("webview") is not None
+
+
+def _open_connect() -> dict:
+    """入队"打开登录窗口"命令，由主线程消费。"""
+    if not webview_available():
+        return {"ok": False, "message": "未安装 pywebview：请执行 pip install pywebview，或用浏览器扩展 / 手动 Token 方式"}
+    try:
+        _connect_queue.put_nowait("connect")
+        return {"ok": True, "message": "已打开登录窗口，请在弹出的 Kimi 页面登录"}
+    except Exception:
+        return {"ok": False, "message": "登录窗口队列异常"}
+
+
+def cycle_bounds(now: datetime, cfg: dict) -> dict:
+    """当前计费周期与上一周期边界。cfg.billing: {day, hour, minute}。"""
+    bill = cfg["billing"]
+    day = max(1, min(int(bill.get("day", 1)), 31))
+    hour = max(0, min(int(bill.get("hour", 0)), 23))
+    minute = max(0, min(int(bill.get("minute", 0)), 59))
+
+    def anchor(dt):
+        dim = calendar.monthrange(dt.year, dt.month)[1]
+        return dt.replace(day=min(day, dim), hour=hour, minute=minute,
+                          second=0, microsecond=0)
+
+    def shift(dt, delta_months):
+        m = dt.month - 1 + delta_months
+        return datetime(dt.year + m // 12, m % 12 + 1, 1,
+                        hour=dt.hour, minute=dt.minute, second=dt.second)
+
+    start = anchor(now)
+    if start > now:
+        start = anchor(shift(now, -1))
+    end = anchor(shift(start, 1))
+    if end <= start:  # 防御：如 day 钳制导致重叠则延后到下月
+        end = anchor(shift(start, 2))
+    prev_start = anchor(shift(start, -1))
+    return {
+        "start": start, "end": end, "prevStart": prev_start,
+        "daysInCycle": (end - start).days,
+        "daysElapsed": max(1, (now - start).days),
+        "label": start.strftime("%m-%d %H:%M"),
+    }
+
+
+VERSION = "2.0.0"  # 与最新 release 标签（去 v 前缀）保持一致，发版时更新
 GITHUB_REPO = "Pierre1231/kimi-board"
 
 _release_cache = {"at": 0.0, "result": None, "checking": False}
@@ -224,19 +1256,19 @@ def cost_of(model: str, u: dict) -> float:
 
 
 def collect_stats():
+    cfg = CFG
     home = kimi_home()
     sessions_dir = home / "sessions"
     now = datetime.now()
     now_ms = int(now.timestamp() * 1000)
 
-    month_start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_start = int(month_start_dt.timestamp() * 1000)
-    prev_end_dt = month_start_dt
-    prev_start_dt = (month_start_dt.replace(day=1) ).replace(
-        year=month_start_dt.year if month_start_dt.month > 1 else month_start_dt.year - 1,
-        month=month_start_dt.month - 1 if month_start_dt.month > 1 else 12,
-    )
-    prev_start, prev_end = int(prev_start_dt.timestamp() * 1000), int(prev_end_dt.timestamp() * 1000)
+    # ---- 计费周期（默认每月 1 日 00:00，可在设置页配置到分钟） ----
+    cb = cycle_bounds(now, cfg)
+    month_start = int(cb["start"].timestamp() * 1000)
+    month_end = int(cb["end"].timestamp() * 1000)
+    prev_start, prev_end = int(cb["prevStart"].timestamp() * 1000), month_start
+    days_in_cycle = cb["daysInCycle"]
+    days_elapsed = cb["daysElapsed"]
     today_start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
     hour_start = now_ms - 3600 * 1000
 
@@ -263,7 +1295,7 @@ def collect_stats():
                     for k in USAGE_KEYS:
                         bucket[k] += usage[k]
 
-                if t >= month_start:
+                if month_start <= t < month_end:
                     add(cards["month"])
                     add(models_month[model])
                 elif prev_start <= t < prev_end:
@@ -290,7 +1322,8 @@ def collect_stats():
             "total": inp + u["output"],
         }
 
-    # ---- 费用估算 ----
+    # ---- 费用估算（价格表由设置页/CLI 决定，可自动同步） ----
+    refresh_pricing()
     cost_by_model = []
     month_cost = cache_cost = miss_cost = out_cost = 0.0
     for model, u in models_month.items():
@@ -303,7 +1336,7 @@ def collect_stats():
         out_cost += oc
         cost_by_model.append({"name": model, "cost": round(cc + mc + oc, 2), **finalize(u)})
     prev_cost = sum(cost_of(m, u) for m, u in models_prev.items())
-    # 合并上月有消耗但本月未用的模型，保证每个模型都能看到费用
+    # 合并上一周期有消耗但本周期未用的模型，保证每个模型都能看到费用
     for model, u in models_prev.items():
         pc = round(cost_of(model, u), 2)
         row = next((r for r in cost_by_model if r["name"] == model), None)
@@ -316,18 +1349,23 @@ def collect_stats():
     cost_by_model.sort(key=lambda r: -(r["cost"] + r["prevCost"]))
     month_cost = cache_cost + miss_cost + out_cost
 
-    days_in_month = calendar.monthrange(now.year, now.month)[1]
-    pace = month_cost / now.day * days_in_month
+    pace = month_cost / days_elapsed * days_in_cycle if days_elapsed else 0.0
 
-    # 套餐价：--plan-price 显式指定 > 自动识别（kimi web 在线时）> 默认 199
-    plan_auto = detect_plan() if PLAN_PRICE is None else None
-    if PLAN_PRICE is not None:
-        plan_price, plan_name, plan_is_auto = PLAN_PRICE, None, False
-    elif plan_auto:
-        plan_price, plan_name, plan_is_auto = plan_auto[0], plan_auto[1], True
-    else:
-        plan_price, plan_name, plan_is_auto = 199.0, None, False
+    # 套餐价：配置显式价 > 配置档位 > 自动识别（kimi web 在线时）> 默认 199
+    plan_price, plan_name, plan_is_auto, plan_src = resolve_plan(cfg)
     payback_pct = round(month_cost / plan_price * 100, 1) if plan_price > 0 else None
+
+    # ---- 官方配额（5 小时 / 周限额），失败不阻塞看板 ----
+    try:
+        quota = quota_snapshot(cfg)
+    except Exception:
+        quota = {"ok": False, "enabled": True, "message": "配额同步异常", "rows": [], "fetchedAt": 0}
+
+    # ---- 月额度（官网 GetSubscriptionStats） ----
+    try:
+        subscription = subscription_snapshot(cfg)
+    except Exception:
+        subscription = {"ok": False, "enabled": True, "message": "月额度同步异常", "data": None}
 
     return {
         "generatedAt": now_ms,
@@ -341,15 +1379,27 @@ def collect_stats():
                 "out": round(out_cost, 2),
             },
             "byModel": cost_by_model,
-            "prevMonthLabel": prev_start_dt.strftime("%Y-%m"),
+            "prevMonthLabel": cb["prevStart"].strftime("%Y-%m"),
             "prevMonthTotal": round(prev_cost, 2),
             "planPrice": plan_price,
             "planName": plan_name,
             "planAuto": plan_is_auto,
+            "planSource": plan_src,
             "paybackPct": payback_pct,
             "pace": round(pace, 2),
-            "daysElapsed": now.day,
-            "daysInMonth": days_in_month,
+            "daysElapsed": days_elapsed,
+            "daysInCycle": days_in_cycle,
+            "cycleLabel": cb["label"],
+            "cycleStart": int(cb["start"].timestamp() * 1000),
+            "cycleEnd": int(cb["end"].timestamp() * 1000),
+        },
+        "pricing": pricing_info(),
+        "quota": quota,
+        "subscription": subscription,
+        "billing": {
+            "day": cfg["billing"]["day"],
+            "hour": cfg["billing"]["hour"],
+            "minute": cfg["billing"]["minute"],
         },
         "hourly": [
             {"t": hour_bucket0 + i * 3600 * 1000, **finalize(u),
@@ -374,6 +1424,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kimi Code 用量看板</title>
+<meta name="kb-secret" content="__KB_SECRET__">
 <style>
   :root {
     --bg: #f5f8fd;
@@ -425,11 +1476,43 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   #refresh:hover { background: var(--blue-deep); }
   #refresh:active { transform: scale(.96); }
+  #settingsLink {
+    font-size: 13px; font-weight: 550; color: var(--blue-deep);
+    text-decoration: none; border: 1px solid #c9dfff; background: #f2f8ff;
+    border-radius: 10px; padding: 7px 14px;
+    transition: background .15s ease, transform .1s ease;
+  }
+  #settingsLink:hover { background: #e2efff; }
+  #settingsLink:active { transform: scale(.96); }
   .update-tip {
     color: var(--blue-deep); text-decoration: none; margin-left: 10px;
     letter-spacing: inherit;
   }
   .update-tip:hover { text-decoration: underline; }
+
+  /* ---- 官方限额 ---- */
+  .quota-rows { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .quota-row {
+    background: #f7faff; border: 1px solid #e3ecfb; border-radius: 14px;
+    padding: 16px 18px 14px;
+  }
+  .quota-row .q-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .quota-row .q-name { font-weight: 650; font-size: 14px; color: var(--text); }
+  .quota-row .q-window { font-size: 11px; color: var(--faint); font-family: var(--mono); }
+  .quota-row .q-nums {
+    display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .quota-row .q-used { font-family: var(--num); font-size: 26px; font-weight: 700; color: var(--text); }
+  .quota-row .q-of { font-size: 12px; color: var(--dim); font-family: var(--mono); }
+  .quota-row .q-pct { margin-left: auto; font-size: 14px; font-weight: 650; color: var(--blue-deep); font-family: var(--num); }
+  .quota-row .q-track { height: 8px; background: #e6edf8; border-radius: 999px; overflow: hidden; margin-bottom: 10px; }
+  .quota-row .q-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #5ea2ff, #2e6fe8); }
+  .quota-row .q-fill.warn { background: linear-gradient(90deg, #ffb454, #ff7a3d); }
+  .quota-row .q-fill.danger { background: linear-gradient(90deg, #ff7a3d, #e5484d); }
+  .quota-row .q-foot { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; color: var(--dim); }
+  .quota-row .q-foot .num { font-family: var(--mono); color: var(--text); }
+  .quota-empty { font-size: 12.5px; color: var(--faint); line-height: 1.9; }
 
   /* ---- 主信息行 ---- */
   .hero { position: relative; margin-bottom: 22px; padding: 2px 0; }
@@ -690,6 +1773,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <span class="spacer"></span>
   <span class="live-dot"></span>
   <span id="updated"></span>
+  <a id="settingsLink" href="/settings" title="设置">设置</a>
   <button id="refresh">刷新</button>
 </div>
 
@@ -700,20 +1784,26 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <div class="cards reveal" id="cards" style="animation-delay:40ms"></div>
 
+<section class="quota reveal" id="quotaSec" style="animation-delay:60ms">
+  <div class="sec-head">官方限额（5 小时 / 周）
+    <span class="right" id="quotaMeta"></span>
+  </div>
+  <div class="quota-rows" id="quotaRows"></div>
+  <div class="quota-rows" id="subRows" style="margin-top:14px"></div>
+  <div class="caption">QUOTA · 官方接口同步 · 每次刷新自动更新</div>
+</section>
+
 <div class="blackcard reveal" style="animation-delay:80ms">
   <div class="cost-grid">
     <div class="cost-left">
       <div class="glyph-field" aria-hidden="true"><div class="glyph-inner" id="glyphField"></div></div>
-      <div class="label"><span class="hex" style="font-size:12px">⬡</span> 等效 API 费用 · 本月
+      <div class="label"><span class="hex" style="font-size:12px">⬡</span> 等效 API 费用 · <span id="costLabel">本月</span>
         <span class="help"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.2"/><path d="M9.4 9a2.7 2.7 0 0 1 5.25.9c0 1.8-2.65 2.4-2.65 3.6"/><line x1="12" y1="16.8" x2="12.01" y2="16.8"/></svg><span class="tip">
           <span class="tp-f"><b>等效费用</b> = 缓存×缓存价 + 输入×输入价 + 输出×输出价</span>
-          <span class="tp-t">
+          <span class="tp-t" id="priceRows">
             <span class="tp-r tp-h"><b>元 / 1M</b><i>缓存</i><i>输入</i><i>输出</i></span>
-            <span class="tp-r"><b>k3 / k3-256k</b><i>2</i><i>20</i><i>100</i></span>
-            <span class="tp-r"><b>k2.7-highspeed</b><i>2.6</i><i>13</i><i>54</i></span>
-            <span class="tp-r"><b>k2.7</b><i>1.3</i><i>6.5</i><i>27</i></span>
           </span>
-          <span class="tp-note">刊例价估算 · 非实际账单 · 缓存创建按输入价计</span>
+          <span class="tp-note" id="priceNote">刊例价估算 · 非实际账单 · 缓存创建按输入价计</span>
         </span></span>
       </div>
       <div class="big" id="costTotal">¥ --</div>
@@ -1087,46 +2177,133 @@ function modelCostList(el, rows) {
   </div>`).join("");
 }
 
+const SRC_TXT = {custom: "手动价", tier: "手动档位", auto: "自动识别", default: "默认价"};
 function paybackHtml(c) {
+  const srcTxt = SRC_TXT[c.planSource] || "";
   const planLabel = c.planName
-    ? `${c.planName} · ¥${c.planPrice} 套餐`
-    : `¥${c.planPrice} 套餐（默认，可 --plan-price 指定）`;
+    ? `${c.planName} · ¥${c.planPrice} 套餐${srcTxt ? " · " + srcTxt : ""}`
+    : `¥${c.planPrice} 套餐（${srcTxt || "默认"}）`;
   if (c.planPrice <= 0 || c.paybackPct === null) {
     return `<div class="pb-label">${c.planName || "免费"} 套餐 · 无月费</div>
       <div class="pb-value">¥0</div>
-      <div class="pb-note">本月等效用量价值 ${yuan(c.monthTotal)}</div>
-      <div class="pb-note">上月（${c.prevMonthLabel}）等效 ${yuan(c.prevMonthTotal)}</div>`;
+      <div class="pb-note">本账期等效用量价值 ${yuan(c.monthTotal)}</div>
+      <div class="pb-note">上一账期（${c.prevMonthLabel}）等效 ${yuan(c.prevMonthTotal)}</div>`;
   }
   const pct = c.paybackPct;
   const w = Math.min(pct, 100).toFixed(1);
   const verdict = pct >= 100
     ? `已回本 ${(pct / 100).toFixed(1)} 倍`
     : `还差 ${yuan(c.planPrice - c.monthTotal)} 回本`;
-  const pace = `当前节奏 · 月底预估 ${yuan(c.pace)}`;
-  return `<div class="pb-label">${planLabel} · 本月回本率</div>
+  const pace = `当前节奏 · 账期预估 ${yuan(c.pace)}`;
+  return `<div class="pb-label">${planLabel} · 本账期回本率</div>
     <div class="pb-value">${pct}%</div>
     <div class="pb-bar"><div class="pb-fill" style="width:${w}%"></div></div>
     <div class="pb-note">${verdict} · ${pace}</div>
-    <div class="pb-note">上月（${c.prevMonthLabel}）等效 ${yuan(c.prevMonthTotal)}</div>`;
+    <div class="pb-note">上一账期（${c.prevMonthLabel}）等效 ${yuan(c.prevMonthTotal)}</div>`;
+}
+
+const fmtNum = n => (n % 1 === 0 ? n : +n.toFixed(2));function fmtDur(s) {
+  s = Math.max(0, Math.round(s));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.round((s % 3600) / 60);
+  if (d) return `${d} 天 ${h} 小时`;
+  if (h) return `${h} 小时 ${m} 分`;
+  return `${m} 分`;
+}
+
+function renderPricing(p) {
+  const rows = Object.entries(p.table || {}).map(([m, v]) =>
+    `<span class="tp-r"><b>${esc(shortName(m))}</b><i>${fmtNum(v[0])}</i><i>${fmtNum(v[1])}</i><i>${fmtNum(v[2])}</i></span>`
+  ).join("");
+  document.getElementById("priceRows").innerHTML =
+    `<span class="tp-r tp-h"><b>${p.currency === "USD" ? "$" : "元"} / 1M</b><i>缓存</i><i>输入</i><i>输出</i></span>` + rows;
+  document.getElementById("priceNote").textContent =
+    `${esc(p.message || "")}${p.fetchedAt ? " · " + new Date(p.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false}) : ""} · 缓存创建按输入价计`;
+}
+
+function renderQuota(q) {
+  const meta = document.getElementById("quotaMeta");
+  const el = document.getElementById("quotaRows");
+  if (!q.enabled) {
+    meta.textContent = "";
+    el.innerHTML = `<div class="quota-empty">配额同步已关闭，可在 <a href="/settings">设置</a> 中开启。</div>`;
+    return;
+  }
+  if (!q.ok) {
+    meta.textContent = "";
+    el.innerHTML = `<div class="quota-empty">无法获取官方限额：${esc(q.message || "")}<br>
+      请在 <a href="/settings">设置</a> 检查同步来源，确认已 <code>kimi login</code> 且 kimi web 在运行。</div>`;
+    return;
+  }
+  meta.textContent = `同步于 ${new Date(q.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false})} · ${q.source === "cloud" ? "云端" : "本地"}接口`;
+  if (!q.rows.length) {
+    el.innerHTML = `<div class="quota-empty">官方未返回限额数据（账号 / 地区可能不适用）。</div>`;
+    return;
+  }
+  el.innerHTML = q.rows.map(r => {
+    const pct = Math.min(100, r.pct);
+    const cls = r.pct >= 95 ? " danger" : r.pct >= 80 ? " warn" : "";
+    const w = r.window;
+    const wnd = w ? (w[1] === "hour" ? `${w[0]} 小时` : w[1] === "week" ? `${w[0]} 周` : `${w[0]} ${w[1]}`) : "";
+    const eta = r.etaSeconds != null ? `预计 ${fmtDur(r.etaSeconds)} 后触顶` : "";
+    const reset = r.resetAt ? `重置 ${new Date(r.resetAt).toLocaleString("zh-CN", {hour12: false})}` : "";
+    return `<div class="quota-row">
+      <div class="q-head"><span class="q-name">${esc(r.name || "限额")}</span><span class="q-window">${esc(wnd)}</span></div>
+      <div class="q-nums"><span class="q-used">${fmt(r.used)}</span><span class="q-of">/ ${fmt(r.limit)} tokens</span><span class="q-pct">${r.pct}%</span></div>
+      <div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>
+      <div class="q-foot"><span class="num">剩余 ${fmt(Math.max(0, r.limit - r.used))}</span><span>${eta}</span></div>
+      ${reset ? `<div class="q-foot"><span></span><span class="num">${esc(reset)}</span></div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function renderSubscription(s) {
+  const el = document.getElementById("subRows");
+  if (!s || !s.enabled) { el.innerHTML = ""; return; }
+  if (!s.ok || !s.data) {
+    el.innerHTML = `<div class="quota-empty">月额度未同步：${esc((s && s.message) || "暂无数据")}<br>
+      点看板右上角「设置」→「连接 Kimi」用内置窗口登录一次，或安装浏览器扩展自动同步。</div>`;
+    return;
+  }
+  const d = s.data;
+  const srcTxt = {manual: "手动 Token", webview: "WebView", extension: "扩展"}[s.source] || s.source;
+  const ratio = d.amountUsedRatio != null ? d.amountUsedRatio * 100 : null;
+  const pct = ratio == null ? 0 : Math.min(100, ratio);
+  const cls = ratio >= 90 ? " danger" : ratio >= 70 ? " warn" : "";
+  const r5 = d.limits5h || {}, r7 = d.limits7d || {};
+  const note = d.notice ? (d.notice.tip || d.notice.content || "") : "";
+  const expire = d.expireTime ? `重置 ${new Date(d.expireTime).toLocaleString("zh-CN", {hour12: false})}` : "";
+  const foot = [];
+  if (r5.ratio != null) foot.push(`5h 已用 ${(r5.ratio * 100).toFixed(1)}%`);
+  if (r7.ratio != null) foot.push(`7d 已用 ${(r7.ratio * 100).toFixed(1)}%`);
+  if (d.kimiCodeUsedRatio != null) foot.push(`KimiCode 占月额 ${(d.kimiCodeUsedRatio * 100).toFixed(1)}%`);
+  el.innerHTML = `<div class="quota-row" style="grid-column:1/-1">
+    <div class="q-head"><span class="q-name">月额度（官网订阅）</span>
+      <span class="q-window">同步于 ${new Date(s.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false})} · ${srcTxt}</span></div>
+    <div class="q-nums"><span class="q-used">${ratio == null ? "--" : ratio.toFixed(1)}%</span>
+      <span class="q-of">月额度已用</span><span class="q-pct">${expire ? esc(expire) : ""}</span></div>
+    <div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>
+    <div class="q-foot">${note ? `<span class="num">${esc(note)}</span>` : "<span></span>"}<span>${foot.join(" · ")}</span></div>
+  </div>`;
 }
 
 async function load() {
   const updated = document.getElementById("updated");
   try {
     const d = await (await fetch("/api/stats", {cache: "no-store"})).json();
+    const c = d.cost;
     document.getElementById("heroMeta").innerHTML =
-      `<span class="hex">⬡</span>${esc((d.cost.planName || "FREE PLAN").toUpperCase())} · ${fmt(d.turns)} TURNS TRACKED`;
+      `<span class="hex">⬡</span>${esc((c.planName || "FREE PLAN").toUpperCase())} · ${fmt(d.turns)} TURNS TRACKED · 账期 ${esc(c.cycleLabel)}`;
     document.getElementById("footMeta").textContent =
       `数据来自本机 wire 文件 · 更新于 ${new Date(d.generatedAt).toLocaleTimeString("zh-CN", {hour12: false})} · 点刷新同步`;
 
+    document.getElementById("costLabel").textContent = c.cycleLabel;
     document.getElementById("cards").innerHTML =
-      cardHtml("本月", "USAGE · 01 MONTH", d.cards.month, true) +
+      cardHtml("本账期", "USAGE · 01 CYCLE", d.cards.month, true) +
       cardHtml("今日", "USAGE · 02 TODAY", d.cards.today, false) +
       cardHtml("近 1 小时", "USAGE · 03 HOUR", d.cards.hour, false);
     document.querySelectorAll("#cards .value").forEach(el =>
       countUp(el, +el.dataset.v, v => fmt(Math.round(v))));
 
-    const c = d.cost;
     countUp(document.getElementById("costTotal"), c.monthTotal, yuan);
     document.getElementById("costBreakdown").innerHTML = `
       <div class="row"><span>缓存命中</span><span class="num">${yuan(c.components.cache)}</span></div>
@@ -1134,6 +2311,9 @@ async function load() {
       <div class="row"><span>输出</span><span class="num">${yuan(c.components.out)}</span></div>`;
     document.getElementById("payback").innerHTML = paybackHtml(c);
     modelCostList(document.getElementById("modelCost"), c.byModel);
+    renderPricing(d.pricing);
+    renderQuota(d.quota);
+    renderSubscription(d.subscription);
 
     TREND.data = d;
     const _sums = {};
@@ -1190,20 +2370,628 @@ load();
 </html>
 """
 
+# ---------------------------------------------------------------- 设置页
+
+SETTINGS_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kimi Board · 设置</title>
+<meta name="kb-secret" content="__KB_SECRET__">
+<style>
+  :root {
+    --bg: #f5f8fd; --card: #ffffff; --line: #e3e9f4; --text: #101828;
+    --dim: #5d6b82; --faint: #a8b4cc; --blue: #3a8dff; --blue-deep: #2e6fe8;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+    --sans: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html { background: var(--bg); }
+  body { background: transparent; color: var(--text); font-family: var(--sans); padding: 26px 32px 60px; max-width: 960px; margin: 0 auto; }
+  .topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 26px; }
+  .hex { color: var(--blue); font-size: 18px; }
+  .crumb { font-size: 13px; color: var(--dim); }
+  .crumb b { color: var(--text); font-weight: 600; }
+  .spacer { flex: 1; }
+  a.back { font-size: 13px; font-weight: 550; color: var(--blue-deep); text-decoration: none; border: 1px solid #c9dfff; background: #f2f8ff; border-radius: 10px; padding: 7px 14px; }
+  a.back:hover { background: #e2efff; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 20px 24px; margin-bottom: 16px; }
+  .sec-head { font-size: 15px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .sec-head .hex { font-size: 13px; }
+  .sec-desc { font-size: 12px; color: var(--dim); font-weight: 400; margin-left: 4px; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
+  .row label { font-size: 13px; color: var(--dim); width: 180px; flex: 0 0 auto; }
+  .row .hint { font-size: 11.5px; color: var(--faint); margin-left: 4px; }
+  select, input[type=number], input[type=text] {
+    font-family: var(--mono); font-size: 13px; color: var(--text);
+    border: 1px solid #d5e0f0; border-radius: 9px; padding: 7px 10px; background: #fbfdff; outline: none;
+  }
+  select:focus, input:focus { border-color: var(--blue); }
+  input[type=number] { width: 84px; }
+  input.wide { width: 140px; }
+  .radio { display: inline-flex; gap: 18px; flex-wrap: wrap; }
+  .radio label { width: auto; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text); }
+  .price-grid { margin: 10px 0 6px; }
+  .price-grid .pg-head, .price-grid .pg-row {
+    display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 10px; align-items: center;
+  }
+  .price-grid .pg-head { font-size: 11px; color: var(--faint); font-family: var(--mono); letter-spacing: .08em; padding: 0 2px 6px; }
+  .price-grid .pg-row { padding: 4px 2px; }
+  .price-grid .pg-row .pn { font-size: 13px; color: var(--text); font-family: var(--mono); }
+  .price-grid input { width: 100%; }
+  .btn { font-size: 13px; font-weight: 550; color: #fff; border: none; cursor: pointer; background: var(--blue); border-radius: 10px; padding: 9px 20px; transition: background .15s ease, transform .1s ease; }
+  .btn:hover { background: var(--blue-deep); }
+  .btn:active { transform: scale(.97); }
+  .btn.ghost { background: #eef4ff; color: var(--blue-deep); border: 1px solid #c9dfff; }
+  .btn.ghost:hover { background: #e2efff; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .actions { display: flex; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
+  #status { font-size: 12.5px; color: var(--dim); margin-top: 10px; min-height: 18px; line-height: 1.7; }
+  #status.ok { color: #128a5b; }
+  #status.err { color: #e5484d; }
+  .mini-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .mini-table th, .mini-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eef1f6; font-family: var(--mono); }
+  .mini-table th { color: var(--faint); font-size: 11px; font-weight: 500; }
+  .mini-table td.src { color: var(--dim); font-size: 11px; }
+  .state-line { font-size: 12.5px; color: var(--dim); margin: 6px 0; line-height: 1.8; }
+  .state-line b { color: var(--text); font-weight: 600; }
+  .state-line .off { color: var(--faint); }
+  .ok-tag { color: #128a5b; } .bad-tag { color: #e5484d; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <span class="hex">⬡</span>
+  <span class="crumb">Kimi Board &nbsp;›&nbsp; <b>设置</b></span>
+  <span class="spacer"></span>
+  <a class="back" href="/">← 返回看板</a>
+</div>
+
+<div class="card">
+  <div class="sec-head"><span class="hex">⬡</span>会员档位 <span class="sec-desc">套餐月费（元），用于计算回本率</span></div>
+  <div class="row">
+    <label>档位模式</label>
+    <span class="radio">
+      <label><input type="radio" name="planMode" value="auto"> 自动识别（kimi web 在线时）</label>
+      <label><input type="radio" name="planMode" value="tier"> 指定档位</label>
+      <label><input type="radio" name="planMode" value="custom"> 自定义月费</label>
+    </span>
+  </div>
+  <div class="row" id="rowTier">
+    <label>档位</label>
+    <select id="planTier"></select>
+    <span class="hint" id="tierPrice"></span>
+  </div>
+  <div class="row" id="rowCustom">
+    <label>月费（元）</label>
+    <input type="number" id="planPrice" min="0" step="0.01" class="wide">
+  </div>
+  <div class="state-line" id="planState"></div>
+</div>
+
+<div class="card">
+  <div class="sec-head"><span class="hex">⬡</span>计费周期 <span class="sec-desc">"本账期" 的起算点，精确到分钟</span></div>
+  <div class="row">
+    <label>每月起算日</label>
+    <input type="number" id="cycleDay" min="1" max="31" step="1">
+    <span class="hint">日（超出当月天数时按当月最后一天）</span>
+  </div>
+  <div class="row">
+    <label>起算时刻</label>
+    <input type="number" id="cycleHour" min="0" max="23" step="1"> <span>时</span>
+    <input type="number" id="cycleMinute" min="0" max="59" step="1"> <span>分</span>
+    <span class="hint">例如：会员从每月 1 日 00:00 开始，保持默认即可</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="sec-head"><span class="hex">⬡</span>价目表 <span class="sec-desc">估算等效 API 费用的单价（元 / 1M tokens）</span></div>
+  <div class="row">
+    <label>价格来源</label>
+    <select id="priceSource">
+      <option value="kimi">Kimi 官方刊例（platform.kimi.com，元）</option>
+      <option value="modelsdev">models.dev（USD，按汇率折元）</option>
+      <option value="manual">手动（仅用下方覆盖值 + 内置兜底）</option>
+    </select>
+  </div>
+  <div class="row" id="rowUsdCny">
+    <label>USD → CNY 汇率</label>
+    <input type="number" id="usdCny" min="0" step="0.001" class="wide">
+    <span class="hint">留空 = 自动获取；自动获取失败时按 7.25 估算</span>
+  </div>
+  <div class="row">
+    <label>k3-256k 计价</label>
+    <span class="radio">
+      <label><input type="checkbox" id="k3half"> 按 k3 半价计算（官方称约为一半，口径未知）</label>
+    </span>
+  </div>
+  <div class="price-grid">
+    <div class="pg-head"><span>模型</span><span>缓存命中</span><span>输入</span><span>输出</span></div>
+    <div class="pg-row"><span class="pn">kimi-code/k3</span><input type="number" step="0.01" data-model="kimi-code/k3"></div>
+    <div class="pg-row"><span class="pn">kimi-code/k3-256k</span><input type="number" step="0.01" data-model="kimi-code/k3-256k"></div>
+    <div class="pg-row"><span class="pn">kimi-code/kimi-for-coding-highspeed</span><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding-highspeed"></div>
+    <div class="pg-row"><span class="pn">kimi-code/kimi-for-coding</span><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding"></div>
+  </div>
+  <div class="state-line">手动覆盖：留空则使用来源价格；填了任意一项即覆盖对应模型。<span id="priceSrcInfo"></span></div>
+  <div class="actions">
+    <button class="btn ghost" id="btnSyncPrice">立即同步价格</button>
+  </div>
+  <div class="mini-table-wrap"><table class="mini-table" id="priceTable"></table></div>
+</div>
+
+<div class="card">
+  <div class="sec-head"><span class="hex">⬡</span>官方限额 <span class="sec-desc">同步 5 小时 / 周限额并自动推算剩余</span></div>
+  <div class="row">
+    <label>同步</label>
+    <span class="radio">
+      <label><input type="checkbox" id="quotaEnabled"> 启用官方限额同步</label>
+    </span>
+  </div>
+  <div class="row">
+    <label>数据来源</label>
+    <select id="quotaSource">
+      <option value="auto">自动（优先本地 kimi web，失败直连云端）</option>
+      <option value="local">仅本地 kimi web 接口</option>
+      <option value="cloud">仅云端 API（需已 kimi login）</option>
+    </select>
+  </div>
+  <div class="actions">
+    <button class="btn ghost" id="btnSyncQuota">立即同步配额</button>
+  </div>
+  <div class="state-line" id="quotaState"></div>
+</div>
+
+<div class="card">
+  <div class="sec-head"><span class="hex">⬡</span>月额度（官网） <span class="sec-desc">订阅月额度已用比例 + 重置时间</span></div>
+  <div class="row">
+    <label>同步方式</label>
+    <select id="subSource">
+      <option value="auto">自动（内置 WebView 登录 / 浏览器扩展推送）</option>
+      <option value="manual">手动粘贴官网 Token（高级 / 救援）</option>
+    </select>
+  </div>
+  <div class="actions">
+    <button class="btn" id="btnConnect">连接 Kimi（WebView 登录）</button>
+    <button class="btn ghost" id="btnSyncSub">立即同步</button>
+    <a class="btn ghost" id="btnOpenSite" href="https://www.kimi.com/membership/subscription?tab=quota" target="_blank" rel="noopener" style="text-decoration:none">在浏览器打开官网配额页</a>
+  </div>
+  <div class="row" id="rowSubToken">
+    <label>官网 Token（JWT）</label>
+    <input type="text" id="subToken" placeholder="浏览器 kimi-auth cookie 的值（eyJ…）；仅在内存 / 系统凭据库" style="width:100%; flex:1">
+  </div>
+  <div class="row" id="rowPersistToken">
+    <label>保存方式</label>
+    <span class="radio">
+      <label><input type="checkbox" id="persistToken"> 保存到系统凭据库（Windows 凭据管理器）</label>
+    </span>
+    <span class="hint">默认不持久化，重启后需重新粘贴；凭据库只在保存时才写入</span>
+  </div>
+  <div class="row">
+    <label>退出登录</label>
+    <button class="btn ghost" id="btnLogout">清除 Kimi 登录数据（WebView Cookie / 存储 / 看板缓存）</button>
+  </div>
+  <div class="state-line" id="subState"></div>
+</div>
+
+<div class="actions">
+  <button class="btn" id="btnSave">保存设置</button>
+  <button class="btn ghost" id="btnReset">恢复默认</button>
+  <span class="spacer"></span>
+  <span class="state-line" id="configPath"></span>
+</div>
+<div id="status"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const STATE = { pricing: null, quota: null };
+const KB_SECRET = (document.querySelector('meta[name="kb-secret"]') || {}).content || "";
+const kh = () => ({ "X-KB-Secret": KB_SECRET, "Content-Type": "application/json" });
+
+function fillPlan(st) {
+  const p = st.config.plan;
+  const mode = p.price != null ? "custom" : p.tier ? "tier" : "auto";
+  document.querySelectorAll("input[name=planMode]").forEach(r => r.checked = r.value === mode);
+  $("planPrice").value = p.price != null ? p.price : "";
+  const tierSel = $("planTier");
+  tierSel.innerHTML = Object.entries(st.planPrices || {})
+    .map(([k, v]) => `<option value="${esc(k)}">${esc(k)} — ¥${v}</option>`).join("");
+  tierSel.value = p.tier || "";
+  updatePlanMode();
+}
+
+function updatePlanMode() {
+  const mode = document.querySelector("input[name=planMode]:checked").value;
+  $("rowTier").style.display = mode === "tier" ? "" : "none";
+  $("rowCustom").style.display = mode === "custom" ? "" : "none";
+  $("tierPrice").textContent = $("planTier").selectedIndex >= 0 && $("planTier").options.length
+    ? `→ ¥${$("planTier").options[$("planTier").selectedIndex].text.split("—")[1] || ""}`
+    : "";
+}
+document.querySelectorAll("input[name=planMode]").forEach(r => r.onchange = updatePlanMode);
+$("planTier").onchange = updatePlanMode;
+
+function fill(st) {
+  const c = st.config;
+  $("cycleDay").value = c.billing.day;
+  $("cycleHour").value = c.billing.hour;
+  $("cycleMinute").value = c.billing.minute;
+  $("priceSource").value = c.pricing.source;
+  $("usdCny").value = c.pricing.usdCny != null ? c.pricing.usdCny : "";
+  $("k3half").checked = !!c.pricing.k3half;
+  $("quotaEnabled").checked = c.quota.enabled;
+  $("quotaSource").value = c.quota.source;
+  $("subSource").value = c.subscription.source;
+  $("subToken").value = "";
+  $("persistToken").checked = !!c.subscription.persistToken;
+  document.querySelectorAll(".price-grid input").forEach(inp => {
+    const ov = (c.pricing.overrides || {})[inp.dataset.model];
+    inp.value = ov ? ov.join(" ") : "";
+  });
+  fillPlan(st);
+  $("rowUsdCny").style.display = $("priceSource").value === "modelsdev" ? "" : "none";
+  const manual = $("subSource").value === "manual";
+  $("rowSubToken").style.display = manual ? "" : "none";
+  $("rowPersistToken").style.display = manual ? "" : "none";
+  renderStatus(st);
+}
+
+function renderStatus(st) {
+  const p = st.pricing, q = st.quota, s = st.subscription;
+  STATE.pricing = p; STATE.quota = q;
+  $("planState").innerHTML = `当前套餐：<b>¥${st.plan.price}</b>${st.plan.name ? " · " + esc(st.plan.name) : ""} · 来源 ${esc(st.plan.source)}`;
+  $("configPath").textContent = "配置文件：" + esc(st.configPath);
+  $("priceSrcInfo").textContent = p.ok ? ` · 来源已生效：${esc(p.message)}` : ` · ${esc(p.message)}`;
+  const rows = Object.entries(p.table || {}).map(([m, v]) =>
+    `<tr><td>${esc(m)}</td><td>${v[0]}</td><td>${v[1]}</td><td>${v[2]}</td></tr>`).join("");
+  $("priceTable").innerHTML = `<tr><th>生效价目（元/1M）</th><th>缓存</th><th>输入</th><th>输出</th></tr>` + rows;
+  $("rowUsdCny").style.display = $("priceSource").value === "modelsdev" ? "" : "none";
+  if (q) {
+    $("quotaState").innerHTML = q.enabled
+      ? (q.ok
+        ? `已同步（<b class="ok-tag">${q.source === "cloud" ? "云端" : "本地"}</b>）· ${(q.rows || []).length} 条限额`
+        : `<b class="bad-tag">同步失败</b> · ${esc(q.message || "")}`)
+      : '<span class="off">官方限额同步已关闭</span>';
+  }
+  if (s) {
+    const srcTxt = {manual: "手动 Token", webview: "WebView 登录", extension: "浏览器扩展"}[s.source] || s.source;
+    const tokTxt = st.manualTokenSet ? " · 已设置 Token（不落盘）" : "";
+    $("subState").innerHTML = !s.enabled
+      ? '<span class="off">月额度同步已关闭</span>'
+      : s.ok
+        ? `已同步（<b class="ok-tag">${srcTxt}</b>）${s.fetchedAt ? " · " + new Date(s.fetchedAt).toLocaleString("zh-CN", {hour12: false}) : ""}${s.message ? " · " + esc(s.message) : ""}${tokTxt}`
+        : `<b class="bad-tag">暂无数据</b> · ${esc(s.message || "")}${tokTxt}`;
+  }
+}
+
+async function load() {
+  const st = await (await fetch("/api/settings", {cache: "no-store"})).json();
+  fill(st);
+}
+async function save() {
+  const mode = document.querySelector("input[name=planMode]:checked").value;
+  const cfg = {
+    plan: {
+      auto: mode === "auto",
+      tier: mode === "tier" ? $("planTier").value : "",
+      price: mode === "custom" ? Number($("planPrice").value) : null,
+    },
+    billing: {
+      day: Math.min(31, Math.max(1, Number($("cycleDay").value) || 1)),
+      hour: Math.min(23, Math.max(0, Number($("cycleHour").value) || 0)),
+      minute: Math.min(59, Math.max(0, Number($("cycleMinute").value) || 0)),
+    },
+    pricing: {
+      source: $("priceSource").value,
+      usdCny: $("usdCny").value ? Number($("usdCny").value) : null,
+      k3half: $("k3half").checked,
+      overrides: {},
+    },
+    quota: { enabled: $("quotaEnabled").checked, source: $("quotaSource").value },
+    subscription: {
+      enabled: true,
+      source: $("subSource").value,
+      persistToken: $("persistToken").checked,
+      token: $("subToken").value.trim(),
+    },
+  };
+  document.querySelectorAll(".price-grid input").forEach(inp => {
+    const nums = inp.value.trim().split(/\\s+/).filter(Boolean).map(Number);
+    if (nums.length === 3 && nums.every(n => isFinite(n) && n >= 0)) {
+      cfg.pricing.overrides[inp.dataset.model] = nums;
+    }
+  });
+  const res = await fetch("/api/settings", {
+    method: "POST", headers: kh(),
+    body: JSON.stringify(cfg),
+  });
+  const st = await res.json();
+  if (res.ok) { setStatus("已保存。" + (st.pricing.ok ? "" : " 提示：" + st.pricing.message), "ok"); }
+  else { setStatus("保存失败：" + (st.error || "未知错误"), "err"); return; }
+  fill(st);
+}
+function setStatus(msg, cls) { const s = $("status"); s.textContent = msg; s.className = cls; }
+$("btnSave").onclick = save;
+$("btnReset").onclick = async () => {
+  const res = await fetch("/api/settings", {method: "POST", headers: kh(), body: "{}"});
+  const st = await res.json();
+  setStatus("已恢复默认设置。", "ok"); fill(st);
+};
+$("btnSyncPrice").onclick = async () => {
+  $("btnSyncPrice").disabled = true;
+  const st = await (await fetch("/api/settings?syncPrice=1", {cache: "no-store"})).json();
+  renderStatus(st);
+  setStatus("价格同步完成。" + (st.pricing.ok ? " 来源：" + st.pricing.message : " 失败：" + st.pricing.message), st.pricing.ok ? "ok" : "err");
+  $("btnSyncPrice").disabled = false;
+};
+$("btnSyncQuota").onclick = async () => {
+  $("btnSyncQuota").disabled = true;
+  const st = await (await fetch("/api/settings?syncQuota=1", {cache: "no-store"})).json();
+  renderStatus(st);
+  setStatus("配额同步完成。", st.quota.ok ? "ok" : "err");
+  $("btnSyncQuota").disabled = false;
+};
+$("btnConnect").onclick = async () => {
+  $("btnConnect").disabled = true;
+  setStatus("正在启动登录窗口…");
+  try {
+    const r = await (await fetch("/api/connect", {method: "POST", headers: kh()})).json();
+    setStatus(r.message, r.ok ? "ok" : "err");
+  } catch (e) {
+    setStatus("启动失败：" + e, "err");
+  }
+  $("btnConnect").disabled = false;
+};
+$("btnSyncSub").onclick = async () => {
+  $("btnSyncSub").disabled = true;
+  setStatus("正在同步月额度…");
+  try {
+    const body = JSON.stringify({subscription: {enabled: true, source: $("subSource").value, persistToken: $("persistToken").checked, token: $("subToken").value.trim()}});
+    const r = await (await fetch("/api/settings", {method: "POST", headers: kh(), body: body})).json();
+    renderStatus(r);
+    const st = await (await fetch("/api/settings?syncQuota=1", {cache: "no-store"})).json();
+    renderStatus(st);
+    setStatus(st.subscription.ok ? "月额度已同步（" + st.subscription.source + "）。" : "暂未收到月额度：" + st.subscription.message, st.subscription.ok ? "ok" : "err");
+  } catch (e) {
+    setStatus("同步失败：" + e, "err");
+  }
+  $("btnSyncSub").disabled = false;
+};
+$("btnLogout").onclick = async () => {
+  $("btnLogout").disabled = true;
+  setStatus("正在清除 Kimi 登录数据…");
+  try {
+    const r = await (await fetch("/api/logout-kimi", {method: "POST", headers: kh()})).json();
+    setStatus(r.message || "已清除", "ok");
+    const st = await (await fetch("/api/settings", {cache: "no-store"})).json();
+    renderStatus(st);
+  } catch (e) {
+    setStatus("清除失败：" + e, "err");
+  }
+  $("btnLogout").disabled = false;
+};
+$("subSource").onchange = () => {
+  const manual = $("subSource").value === "manual";
+  $("rowSubToken").style.display = manual ? "" : "none";
+  $("rowPersistToken").style.display = manual ? "" : "none";
+};
+$("priceSource").onchange = () => { $("rowUsdCny").style.display = $("priceSource").value === "modelsdev" ? "" : "none"; };
+load();
+</script>
+</body>
+</html>
+"""
+
 # ---------------------------------------------------------------- 服务
 
 
+def normalize_config(raw: dict) -> dict:
+    """校验并归一化前端 / CLI 提交的配置。"""
+    base = default_config()
+    raw = raw or {}
+    plan = raw.get("plan") or {}
+    billing = raw.get("billing") or {}
+    pricing = raw.get("pricing") or {}
+    quota = raw.get("quota") or {}
+    subscription = raw.get("subscription") or {}
+    overrides = {}
+    for m, v in (pricing.get("overrides") or {}).items():
+        if isinstance(v, (list, tuple)) and len(v) == 3:
+            try:
+                overrides[m] = [max(0.0, float(x)) for x in v]
+            except (TypeError, ValueError):
+                pass
+    return {
+        "version": 1,
+        "plan": {
+            "auto": bool(plan.get("auto", base["plan"]["auto"])),
+            "tier": str(plan.get("tier", "") or ""),
+            "price": (None if plan.get("price") in (None, "", "null")
+                      else float(plan["price"])),
+        },
+        "billing": {
+            "day": min(31, max(1, int(billing.get("day", 1) or 1))),
+            "hour": min(23, max(0, int(billing.get("hour", 0) or 0))),
+            "minute": min(59, max(0, int(billing.get("minute", 0) or 0))),
+        },
+        "pricing": {
+            "source": pricing.get("source", "kimi") if pricing.get("source") in ("kimi", "modelsdev", "manual") else "kimi",
+            "usdCny": (None if pricing.get("usdCny") in (None, "", 0, "null")
+                       else float(pricing["usdCny"])),
+            "overrides": overrides,
+            "k3half": bool(pricing.get("k3half", base["pricing"].get("k3half", False))),
+        },
+        "quota": {
+            "enabled": bool(quota.get("enabled", base["quota"]["enabled"])),
+            "source": quota.get("source", "auto") if quota.get("source") in ("auto", "local", "cloud") else "auto",
+        },
+        "subscription": {
+            "enabled": bool(subscription.get("enabled", base["subscription"]["enabled"])),
+            "source": subscription.get("source", "auto") if subscription.get("source") in ("auto", "manual") else "auto",
+            "persistToken": bool(subscription.get("persistToken", base["subscription"].get("persistToken", False))),
+        },
+    }
+
+
+def apply_config(cfg: dict) -> None:
+    """应用配置并重置价格 / 配额缓存。"""
+    global CFG
+    CFG = normalize_config(cfg)
+    refresh_pricing(force=True)
+    with _quota_lock:
+        _quota_cache.update(at=0.0, data=None, busy=False)
+
+
+def settings_state(sync_price=False, sync_quota=False) -> dict:
+    cfg = CFG
+    if sync_price:
+        refresh_pricing(force=True)
+    plan_price, plan_name, plan_is_auto, plan_src = resolve_plan(cfg)
+    return {
+        "config": cfg,
+        "configPath": str(config_path()),
+        "plan": {"price": plan_price, "name": plan_name, "auto": plan_is_auto, "source": plan_src},
+        "pricing": pricing_info(),
+        "quota": quota_snapshot(cfg, force=sync_quota),
+        "subscription": subscription_snapshot(cfg, force=sync_quota),
+        "manualTokenSet": bool(get_manual_token(cfg)),
+        "fxRate": usd_cny_rate(cfg)[0],
+        "planPrices": PLAN_PRICES,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
+    # ---- 本地接口防护：Host 回环校验 + Origin 白名单 + 随机 secret ----
+    @staticmethod
+    def _host_ok(host: str) -> bool:
+        h = (host or "").split(":")[0].strip("[]")
+        return h in ("127.0.0.1", "localhost", "::1") or h.endswith(".localhost")
+
+    def _origin(self):
+        return self.headers.get("Origin") or ""
+
+    def _origin_allowed(self):
+        """返回 None=拒绝；'same'/'local'=放行；'ext'=需校验 secret。"""
+        origin = self._origin()
+        if not origin:
+            return "local"  # 非浏览器来源（本地脚本/进程）
+        host = self.headers.get("Host") or ""
+        if origin == f"http://{host}":
+            return "same"
+        if _LOCAL_ORIGIN_RE.match(origin):
+            return "local"
+        if origin.startswith("chrome-extension://"):
+            return "ext"
+        return None
+
+    def _authorized(self):
+        if not self._host_ok(self.headers.get("Host") or ""):
+            return False
+        oa = self._origin_allowed()
+        if oa is None:
+            return False
+        if oa == "ext" and self.headers.get("X-KB-Secret") != _local_secret:
+            return False
+        return True
+
+    def _deny(self, code=403):
+        self._send(code, "text/plain", b"forbidden")
+
+    def do_OPTIONS(self):
+        oa = self._origin_allowed()
+        if oa is None or not self._host_ok(self.headers.get("Host") or ""):
+            self._deny()
+            return
+        self.send_response(204)
+        origin = self._origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-KB-Secret")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            body = INDEX_HTML.encode("utf-8")
+        if not self._authorized():
+            self._deny()
+            return
+        path = urllib.parse.urlsplit(self.path)
+        if path.path in ("/", "/index.html"):
+            body = INDEX_HTML.replace("__KB_SECRET__", _local_secret).encode("utf-8")
             self._send(200, "text/html; charset=utf-8", body)
-        elif self.path.startswith("/api/stats"):
+        elif path.path == "/settings":
+            body = SETTINGS_HTML.replace("__KB_SECRET__", _local_secret).encode("utf-8")
+            self._send(200, "text/html; charset=utf-8", body)
+        elif path.path.startswith("/api/stats"):
             body = json.dumps(collect_stats(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
-        elif self.path.startswith("/api/version"):
+        elif path.path.startswith("/api/settings"):
+            q = urllib.parse.parse_qs(path.query)
+            st = settings_state(sync_price="syncPrice" in q, sync_quota="syncQuota" in q)
+            body = json.dumps(st, ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif path.path.startswith("/api/quota"):
+            q = urllib.parse.parse_qs(path.query)
+            body = json.dumps(quota_snapshot(CFG, force="refresh" in q), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif path.path.startswith("/api/subscription"):
+            q = urllib.parse.parse_qs(path.query)
+            body = json.dumps(subscription_snapshot(CFG, force="refresh" in q), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif path.path.startswith("/api/connect"):
+            body = json.dumps(_open_connect(), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif path.path.startswith("/api/version"):
             body = json.dumps(check_update(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
+        else:
+            self._send(404, "text/plain", b"not found")
+
+    def do_POST(self):
+        if not self._authorized():
+            self._deny()
+            return
+        path = urllib.parse.urlsplit(self.path)
+        if path.path == "/api/settings":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            except Exception:
+                self._send(400, "application/json; charset=utf-8",
+                           b'{"error":"invalid json"}')
+                return
+            try:
+                # 手动 Token：只在内存/系统凭据库，不进配置文件
+                raw_sub = raw.get("subscription") or {}
+                set_manual_token(raw_sub.get("token", ""), bool(raw_sub.get("persistToken")))
+                cfg = normalize_config(raw)
+                save_config(cfg)
+                apply_config(cfg)
+            except Exception as e:
+                self._send(400, "application/json; charset=utf-8",
+                           json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+                return
+            body = json.dumps(settings_state(), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif path.path.startswith("/api/subscription"):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n).decode("utf-8") if n else "{}"
+            except Exception:
+                raw = "{}"
+            q = urllib.parse.parse_qs(path.query)
+            source = (q.get("source") or ["auto"])[0]
+            resp = handle_subscription_post(raw, source)
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps(resp, ensure_ascii=False).encode("utf-8"))
+        elif path.path == "/api/connect":
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps(_open_connect(), ensure_ascii=False).encode("utf-8"))
+        elif path.path == "/api/logout-kimi":
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps(clear_kimi_login(), ensure_ascii=False).encode("utf-8"))
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -1212,8 +3000,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        # 允许浏览器扩展从 kimi webui 页面探测服务状态
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # 只对白名单来源回显 ACAO，杜绝任意网页读取本地数据
+        origin = self._origin()
+        if origin and self._origin_allowed():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1222,15 +3013,52 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global PLAN_PRICE
+    global CFG, SERVER_PORT, _connect_queue
+    import queue
+
     ap = argparse.ArgumentParser(description="kimi code token 消耗网页看板")
     ap.add_argument("--port", type=int, default=8321)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--plan-price", type=float, default=None,
-                    help="会员月费（默认自动识别；识别失败时按 199 计）")
+                    help="会员月费（元），覆盖配置文件；默认自动识别，失败按 199 计")
+    ap.add_argument("--plan-tier", default=None,
+                    help="会员档位名（adagio/andante/moderato/allegretto/allegro），覆盖配置")
+    ap.add_argument("--price-source", default=None,
+                    choices=("kimi", "modelsdev", "manual"),
+                    help="价目来源：kimi=官方刊例(元) modelsdev=models.dev(USD折元) manual=手动")
+    ap.add_argument("--cycle-day", type=int, default=None, help="计费周期每月起算日（1-31）")
+    ap.add_argument("--cycle-hour", type=int, default=None, help="计费周期起算小时（0-23）")
+    ap.add_argument("--cycle-minute", type=int, default=None, help="计费周期起算分钟（0-59）")
+    ap.add_argument("--usd-cny", type=float, default=None, help="USD→CNY 汇率（modelsdev 来源时）")
+    ap.add_argument("--k3-256k-half", action="store_true",
+                    help="kimi-code/k3-256k 按 k3 生效价的 50% 计价（默认与 k3 同价）")
+    ap.add_argument("--no-quota", action="store_true", help="关闭官方限额同步")
     ap.add_argument("--no-open", action="store_true", help="启动后不自动打开浏览器")
     args = ap.parse_args()
-    PLAN_PRICE = args.plan_price
+
+    cfg = load_config()
+    if args.plan_price is not None:
+        cfg["plan"]["price"] = args.plan_price
+    if args.plan_tier:
+        cfg["plan"]["tier"] = args.plan_tier
+    if args.price_source:
+        cfg["pricing"]["source"] = args.price_source
+    if args.cycle_day is not None:
+        cfg["billing"]["day"] = args.cycle_day
+    if args.cycle_hour is not None:
+        cfg["billing"]["hour"] = args.cycle_hour
+    if args.cycle_minute is not None:
+        cfg["billing"]["minute"] = args.cycle_minute
+    if args.usd_cny is not None:
+        cfg["pricing"]["usdCny"] = args.usd_cny
+    if args.k3_256k_half:
+        cfg["pricing"]["k3half"] = True
+    if args.no_quota:
+        cfg["quota"]["enabled"] = False
+    CFG = normalize_config(cfg)
+
+    # 用上次快照预填价目，首屏即显示正确价格；随后后台抓取更新
+    _seed_price_cache()
 
     # pythonw / 无控制台环境下 sys.stdout、sys.stderr 为 None,
     # print 与请求日志会抛 AttributeError,重定向到空设备
@@ -1242,9 +3070,17 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+    # 后台预热：首屏进入前先把价格/配额抓回来，避免首个请求卡网络
+    threading.Thread(target=lambda: (refresh_pricing(force=True),
+                                     fetch_quota(CFG, force=True)),
+                     daemon=True).start()
+
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    SERVER_PORT = args.port
     url = f"http://{args.host}:{args.port}"
     print(f"kimi code token 看板已启动：{url}  (Ctrl+C 停止)")
+    print(f"  设置页：{url}/settings · 配置文件：{config_path()}")
     if not args.no_open:
         try:
             import webbrowser
@@ -1252,8 +3088,18 @@ def main():
             webbrowser.open(url)
         except Exception:
             pass
+
+    # HTTP 服务放后台线程；主线程专跑"连接 Kimi"的 WebView（pywebview 需主线程）
+    _connect_queue = queue.Queue()
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
     try:
-        server.serve_forever()
+        while True:
+            cmd = _connect_queue.get()
+            if cmd == "logout":
+                run_logout_webview()
+            else:
+                run_connect_webview(args.port)
     except KeyboardInterrupt:
         pass
 
