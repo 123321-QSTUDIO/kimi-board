@@ -116,6 +116,12 @@ def default_config() -> dict:
         "pricing": {"source": "kimi", "usdCny": None, "overrides": {}, "k3half": False},
         "quota": {"enabled": True, "source": "auto"},
         "subscription": {"enabled": True, "source": "auto", "persistToken": False},
+        # cc-switch 同步：合并它代理记录的 KimiCode 用量（其他 CLI 走 Kimi API 的部分）
+        "ccs": {
+            "enabled": False,
+            "dbPath": "~/.cc-switch/cc-switch.db",
+            "models": ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"],
+        },
     }
 
 
@@ -1927,6 +1933,75 @@ def empty_usage():
     return {k: 0 for k in USAGE_KEYS}
 
 
+# cc-switch 的 proxy_request_logs 字段 → 看板 USAGE_KEYS 的映射
+# cc input_tokens/cache_read_tokens/cache_creation_tokens/output_tokens 与 wire 口径一致（分开记账）
+_CCS_COL = ("input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens")
+_CCS_KEY = ("inputOther", "inputCacheRead", "inputCacheCreation", "output")
+_CCS_DEFAULT_DB = "~/.cc-switch/cc-switch.db"
+
+
+def _ccs_records(cfg: dict):
+    """读取 cc-switch 数据库里 KimiCode 模型（k3 等 4 个）的代理日志。
+
+    返回生成器，每条为 (unix秒, 模型名, usage_dict)；失败返回空。
+    只读拷贝到临时文件再查，避免 cc-switch 正在写入时的锁/竞态。
+    模型过滤严格限定在配置的 ccs.models 列表，其他 CLI/聚合平台的模型一律不计。
+    """
+    ccs = cfg.get("ccs") or {}
+    if not ccs.get("enabled"):
+        return
+    models = tuple(ccs.get("models") or _CCS_MODELS_DEFAULT)
+    db_path = str(ccs.get("dbPath") or _CCS_DEFAULT_DB).replace("~", str(Path.home()))
+    src = Path(db_path)
+    if not src.is_file():
+        return
+    tmp = None
+    try:
+        import shutil
+        import sqlite3
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        shutil.copy2(src, tmp)
+        con = sqlite3.connect(tmp, timeout=2)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        placeholders = ",".join("?" for _ in models)
+        cur.execute(
+            "SELECT created_at, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_creation_tokens FROM proxy_request_logs "
+            f"WHERE model IN ({placeholders}) AND created_at IS NOT NULL",
+            models,
+        )
+        for row in cur:
+            try:
+                ts = int(row["created_at"])
+                model = str(row["model"] or "")
+                usage = {_CCS_KEY[i]: int(row[_CCS_COL[i]] or 0) for i in range(4)}
+                yield (ts, _CCS_MODEL_MAP.get(model, model), usage)
+            except (TypeError, ValueError):
+                continue
+        con.close()
+    except Exception:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+_CCS_MODELS_DEFAULT = ("k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed")
+# cc-switch 模型名 → 看板统一模型名（带 kimi-code/ 前缀，与 wire 保持一致，价格/配色/趋势共用）
+_CCS_MODEL_MAP = {
+    "k3": "kimi-code/k3",
+    "k3-256k": "kimi-code/k3-256k",
+    "kimi-for-coding": "kimi-code/kimi-for-coding",
+    "kimi-for-coding-highspeed": "kimi-code/kimi-for-coding-highspeed",
+}
+
+
 def cost_of(model: str, u: dict) -> float:
     """按刊例价估算费用（元）。inputCacheCreation 按未命中输入计。"""
     hit, miss, out = price_of(model)
@@ -2014,6 +2089,43 @@ def collect_stats():
                 for _rk in ("15m", "30m", "60m"):
                     if t >= now_ms - recent_ms[_rk]:
                         add(recent_win[_rk])
+
+    # ---- cc-switch 同步：合并其他 CLI（claude/codex/opencode）走 KimiCode API 的用量 ----
+    # token 拷回后按看板自己的价格体系算费（不信任 ccs 的 USD 费用），模型名与 wire 对齐。
+    for t, model, usage in _ccs_records(cfg):
+        t_ms = int(t) * 1000
+
+        def add_ccs(bucket):
+            for k in USAGE_KEYS:
+                bucket[k] += usage[k]
+
+        if month_start <= t_ms < month_end:
+            add_ccs(cards["month"])
+            add_ccs(models_month[model])
+        elif prev_start <= t_ms < prev_end:
+            add_ccs(models_prev[model])
+        if t_ms >= today_start:
+            add_ccs(cards["today"])
+        if t_ms >= hour_start:
+            add_ccs(cards["hour"])
+        if t_ms >= hour_bucket0:
+            i = (t_ms - hour_bucket0) // (3600 * 1000)
+            add_ccs(hourly[i])
+            add_ccs(hourly_models[i][model])
+        if t_ms >= day_bucket0:
+            i = (t_ms - day_bucket0) // (86400 * 1000)
+            add_ccs(daily[i])
+            add_ccs(daily_models[i][model])
+        if month_start <= t_ms < month_end:
+            i = (t_ms - month_start) // cycle_day_ms
+            while i >= len(cycle_daily):
+                cycle_daily.append(empty_usage())
+                cycle_daily_models.append(defaultdict(empty_usage))
+            add_ccs(cycle_daily[i])
+            add_ccs(cycle_daily_models[i][model])
+        for _rk in ("15m", "30m", "60m"):
+            if t_ms >= now_ms - recent_ms[_rk]:
+                add_ccs(recent_win[_rk])
 
     def finalize(u):
         inp = u["inputOther"] + u["inputCacheRead"] + u["inputCacheCreation"]
@@ -3438,6 +3550,22 @@ SETTINGS_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="card">
+  <div class="sec-head"><span class="hex">⬡</span>cc-switch 同步 <span class="sec-desc">合并其他 CLI（Claude Code / Codex / OpenCode）走 KimiCode API 的用量</span></div>
+  <div class="row">
+    <label>启用</label>
+    <span class="radio">
+      <label><input type="checkbox" id="ccsEnabled"> 合并 cc-switch 里的 KimiCode 用量（k3 / k3-256k / kimi-for-coding / kimi-for-coding-highspeed）</label>
+    </span>
+    <span class="hint">只统计上述 4 个 KimiCode 模型，Kimi API 与其他聚合平台模型不纳入；每次刷新看板时同步读取</span>
+  </div>
+  <div class="row">
+    <label>数据库路径</label>
+    <input type="text" id="ccsDbPath" placeholder="~/.cc-switch/cc-switch.db" class="wide">
+  </div>
+  <div class="state-line" id="ccsState"></div>
+</div>
+
 <div class="actions">
   <button class="btn" id="btnSave">立即保存</button>
   <button class="btn ghost" id="btnReset">恢复默认</button>
@@ -3500,6 +3628,8 @@ function fill(st) {
   $("rowUsdCny").style.display = $("priceSource").value === "modelsdev" ? "" : "none";
   updatePriceMode();
   updateSubMode();
+  $("ccsEnabled").checked = !!(c.ccs && c.ccs.enabled);
+  $("ccsDbPath").value = (c.ccs && c.ccs.dbPath) || "";
   renderStatus(st);
 }
 
@@ -3542,6 +3672,12 @@ function renderStatus(st) {
       : s.ok
         ? `已同步（<b class="ok-tag">${srcTxt}</b>）${s.fetchedAt ? " · " + new Date(s.fetchedAt).toLocaleString("zh-CN", {hour12: false}) : ""}${s.message ? " · " + esc(s.message) : ""}${tokTxt}${bgTxt}`
         : `<b class="bad-tag">暂无数据</b> · ${esc(s.message || "")}${tokTxt}`;
+  }
+  const cs = st.config && st.config.ccs;
+  if (cs) {
+    $("ccsState").innerHTML = cs.enabled
+      ? `<b class="ok-tag">已启用</b> · 数据源 ${esc(cs.dbPath)} · 每次刷新时同步读取`
+      : '<span class="off">已关闭（默认不合并 cc-switch 数据）</span>';
   }
 }
 
@@ -3595,6 +3731,11 @@ async function save() {
       persistToken: $("persistToken").checked,
       token: $("subToken").value.trim(),
     },
+    ccs: {
+      enabled: $("ccsEnabled").checked,
+      dbPath: $("ccsDbPath").value.trim() || "~/.cc-switch/cc-switch.db",
+      models: ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"],
+    },
   };
   const overrides = {};
   document.querySelectorAll("#overrideGrid input[data-model]").forEach(inp => {
@@ -3631,7 +3772,7 @@ function scheduleSave() {
 // 自动保存：任何设置项变更后防抖保存
 document.querySelectorAll("input[name=planMode]").forEach(r => r.addEventListener("change", scheduleSave));
 ["planTier", "planPrice", "cycleDay", "cycleHour", "cycleMinute", "priceSource", "usdCny", "k3half",
- "quotaSource", "persistToken", "subToken"].forEach(id => {
+ "quotaSource", "persistToken", "subToken", "ccsEnabled", "ccsDbPath"].forEach(id => {
   const el = $(id);
   if (el) {
     el.addEventListener("input", scheduleSave);
@@ -3731,9 +3872,13 @@ load();
 # ---------------------------------------------------------------- 服务
 
 
-def normalize_config(raw: dict) -> dict:
-    """校验并归一化前端 / CLI 提交的配置。"""
-    base = default_config()
+def normalize_config(raw: dict, cur: dict = None) -> dict:
+    """校验并归一化前端 / CLI 提交的配置。
+
+    cur: 当前生效配置。缺失字段继承 cur（保留已有设置），只有显式提交的字段才更新；
+        不传 cur 时退化为默认值。这样部分字段的保存（如只改 ccs）不会重置 plan/billing 等。
+    """
+    base = cur if cur is not None else default_config()
     raw = raw or {}
     plan = raw.get("plan") or {}
     billing = raw.get("billing") or {}
@@ -3747,34 +3892,45 @@ def normalize_config(raw: dict) -> dict:
                 overrides[m] = [max(0.0, float(x)) for x in v]
             except (TypeError, ValueError):
                 pass
+    bp = base.get("plan") or {}
+    bb = base.get("billing") or {}
+    bp_ = base.get("pricing") or {}
+    bq = base.get("quota") or {}
+    bs = base.get("subscription") or {}
+    bc = base.get("ccs") or {}
     return {
         "version": 1,
         "plan": {
-            "auto": bool(plan.get("auto", base["plan"]["auto"])),
-            "tier": str(plan.get("tier", "") or ""),
+            "auto": bool(plan.get("auto", bp.get("auto", True))),
+            "tier": str(plan.get("tier", bp.get("tier", "")) or ""),
             "price": (None if plan.get("price") in (None, "", "null")
                       else float(plan["price"])),
         },
         "billing": {
-            "day": min(31, max(1, int(billing.get("day", 1) or 1))),
-            "hour": min(23, max(0, int(billing.get("hour", 0) or 0))),
-            "minute": min(59, max(0, int(billing.get("minute", 0) or 0))),
+            "day": min(31, max(1, int(billing.get("day", bb.get("day", 1)) or bb.get("day", 1)))),
+            "hour": min(23, max(0, int(billing.get("hour", bb.get("hour", 0)) or bb.get("hour", 0)))),
+            "minute": min(59, max(0, int(billing.get("minute", bb.get("minute", 0)) or bb.get("minute", 0)))),
         },
         "pricing": {
-            "source": pricing.get("source", "kimi") if pricing.get("source") in ("kimi", "modelsdev", "manual") else "kimi",
+            "source": pricing.get("source") if pricing.get("source") in ("kimi", "modelsdev", "manual") else bp_.get("source", "kimi"),
             "usdCny": (None if pricing.get("usdCny") in (None, "", 0, "null")
                        else float(pricing["usdCny"])),
             "overrides": overrides,
-            "k3half": bool(pricing.get("k3half", base["pricing"].get("k3half", False))),
+            "k3half": bool(pricing.get("k3half", bp_.get("k3half", False))),
         },
         "quota": {
-            "enabled": bool(quota.get("enabled", base["quota"]["enabled"])),
-            "source": quota.get("source", "auto") if quota.get("source") in ("auto", "local", "cloud") else "auto",
+            "enabled": bool(quota.get("enabled", bq.get("enabled", True))),
+            "source": quota.get("source") if quota.get("source") in ("auto", "local", "cloud") else bq.get("source", "auto"),
         },
         "subscription": {
-            "enabled": bool(subscription.get("enabled", base["subscription"]["enabled"])),
-            "source": subscription.get("source", "auto") if subscription.get("source") in ("auto", "manual") else "auto",
-            "persistToken": bool(subscription.get("persistToken", base["subscription"].get("persistToken", False))),
+            "enabled": bool(subscription.get("enabled", bs.get("enabled", True))),
+            "source": subscription.get("source") if subscription.get("source") in ("auto", "manual") else bs.get("source", "auto"),
+            "persistToken": bool(subscription.get("persistToken", bs.get("persistToken", False))),
+        },
+        "ccs": {
+            "enabled": bool((ccs := raw.get("ccs") or {}).get("enabled", bc.get("enabled", False))),
+            "dbPath": str(ccs.get("dbPath") or bc.get("dbPath") or "~/.cc-switch/cc-switch.db"),
+            "models": [str(m) for m in (ccs.get("models") or bc.get("models") or ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"])][:10],
         },
     }
 
@@ -3782,7 +3938,7 @@ def normalize_config(raw: dict) -> dict:
 def apply_config(cfg: dict) -> None:
     """应用配置并重置价格 / 配额缓存。"""
     global CFG
-    CFG = normalize_config(cfg)
+    CFG = normalize_config(cfg, cur=CFG)
     refresh_pricing(force=True)
     with _quota_lock:
         _quota_cache.update(at=0.0, data=None, busy=False)
@@ -3925,7 +4081,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 手动 Token：只在内存/系统凭据库，不进配置文件
                 raw_sub = raw.get("subscription") or {}
                 set_manual_token(raw_sub.get("token", ""), bool(raw_sub.get("persistToken")))
-                cfg = normalize_config(raw)
+                cfg = normalize_config(raw, cur=CFG)
                 save_config(cfg)
                 apply_config(cfg)
             except Exception as e:
