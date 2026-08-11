@@ -21,6 +21,19 @@
     return secret;
   }
 
+  // 看板配置的数据源是否接受扩展推送（auto 或 extension 才推，webview/manual 不打扰）
+  async function boardWantsExtension() {
+    try {
+      const res = await fetch(DASH + "/api/settings", { cache: "no-store" });
+      if (!res.ok) return false;
+      const st = await res.json();
+      const src = st.config && st.config.subscription && st.config.subscription.source;
+      return src === "auto" || src === "extension";
+    } catch {
+      return false; // 看板未启动
+    }
+  }
+
   function postToBoard(text) {
     return fetch(DASH + "/api/subscription?source=extension", {
       method: "POST",
@@ -43,6 +56,8 @@
 
   async function sync() {
     try {
+      // 看板配置不接受扩展推送时（webview/manual），直接跳过，避免无脑打扰
+      if (!(await boardWantsExtension())) return;
       let text;
       try {
         text = await fetchWithCreds();

@@ -975,7 +975,19 @@ def _store_subscription(norm: dict, source: str) -> None:
 
 
 def handle_subscription_post(raw, source: str) -> dict:
-    """WebView / 扩展推送：归一化后仅存结果，不碰凭据。"""
+    """WebView / 扩展推送：按配置的 subscription.source 做来源过滤。
+
+    只有配置指定的数据源才接受，避免 WebView 与扩展同时推时互相覆盖：
+      auto      → 接受任意来源（谁最后推谁生效，向后兼容）
+      webview   → 只接受 webview 来源
+      extension → 只接受 extension 来源
+      manual    → 忽略所有推送（只用手动 token）
+    """
+    cfg = CFG
+    want = (cfg.get("subscription") or {}).get("source", "auto")
+    if want not in ("auto",) and want != source:
+        return {"ok": False, "ignored": True,
+                "message": f"当前配置使用 {want} 数据源，忽略 {source} 推送"}
     norm = normalize_subscription(raw)
     if norm is None:
         return {"ok": False, "error": "不是 GetSubscriptionStats 的返回结构"}
@@ -3615,8 +3627,8 @@ function fill(st) {
   $("usdCny").value = c.pricing.usdCny != null ? c.pricing.usdCny : "";
   $("k3half").checked = !!c.pricing.k3half;
   $("quotaSource").value = c.quota.source;
-  const sm = c.subscription.source === "manual" ? "manual"
-    : (st.subscription && st.subscription.source === "extension" ? "extension" : "webview");
+  const sm = (c.subscription.source === "manual" || c.subscription.source === "extension"
+    || c.subscription.source === "webview") ? c.subscription.source : "webview";  // auto → 默认 webview
   document.querySelectorAll("input[name=subMode]").forEach(r => r.checked = r.value === sm);
   $("subToken").value = "";
   $("persistToken").checked = !!c.subscription.persistToken;
@@ -3727,7 +3739,7 @@ async function save() {
     quota: { source: $("quotaSource").value },
     subscription: {
       enabled: true,
-      source: document.querySelector("input[name=subMode]:checked").value === "manual" ? "manual" : "auto",
+      source: document.querySelector("input[name=subMode]:checked").value,
       persistToken: $("persistToken").checked,
       token: $("subToken").value.trim(),
     },
@@ -3826,7 +3838,7 @@ $("btnSyncSub").onclick = async () => {
   $("btnSyncSub").disabled = true;
   setStatus("正在同步月额度…");
   try {
-    const body = JSON.stringify({subscription: {enabled: true, source: document.querySelector("input[name=subMode]:checked").value === "manual" ? "manual" : "auto", persistToken: $("persistToken").checked, token: $("subToken").value.trim()}});
+    const body = JSON.stringify({subscription: {enabled: true, source: document.querySelector("input[name=subMode]:checked").value, persistToken: $("persistToken").checked, token: $("subToken").value.trim()}});
     const r = await (await fetch("/api/settings", {method: "POST", headers: kh(), body: body})).json();
     renderStatus(r);
     const st = await (await fetch("/api/settings?syncQuota=1", {cache: "no-store"})).json();
@@ -3924,7 +3936,7 @@ def normalize_config(raw: dict, cur: dict = None) -> dict:
         },
         "subscription": {
             "enabled": bool(subscription.get("enabled", bs.get("enabled", True))),
-            "source": subscription.get("source") if subscription.get("source") in ("auto", "manual") else bs.get("source", "auto"),
+            "source": subscription.get("source") if subscription.get("source") in ("auto", "webview", "extension", "manual") else bs.get("source", "auto"),
             "persistToken": bool(subscription.get("persistToken", bs.get("persistToken", False))),
         },
         "ccs": {
@@ -3974,7 +3986,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Origin") or ""
 
     def _origin_allowed(self):
-        """返回 None=拒绝；'same'/'local'=放行；'ext'=需校验 secret。"""
+        """返回 None=拒绝；'same'/'local'=放行；'ext'=需校验 secret；'read'=只读来源(kimi.com)。"""
         origin = self._origin()
         if not origin:
             return "local"  # 非浏览器来源（本地脚本/进程）
@@ -3985,6 +3997,9 @@ class Handler(BaseHTTPRequestHandler):
             return "local"
         if origin.startswith("chrome-extension://"):
             return "ext"
+        # 插件 content.js 运行在 kimi.com 页面里，读取看板数据展示用（只读，不带凭据）
+        if origin in ("https://www.kimi.com", "https://kimi.com"):
+            return "read"
         return None
 
     def _authorized(self):
@@ -3994,6 +4009,9 @@ class Handler(BaseHTTPRequestHandler):
         if oa is None:
             return False
         if oa == "ext" and self.headers.get("X-KB-Secret") != _local_secret:
+            return False
+        # 只读来源（kimi.com）仅放行 GET；写操作仍需 secret/本地来源
+        if oa == "read" and self.command != "GET":
             return False
         return True
 
