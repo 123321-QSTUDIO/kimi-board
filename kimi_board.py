@@ -185,6 +185,7 @@ _connect_queue = None    # "连接 Kimi" 命令队列，由主线程消费并开
 _webview_active = False  # 后台 WebView 会话是否在运行
 _webview_stop = False    # 请求后台 WebView 停止并清理登录态
 _webview_dbg = {}        # WebView 内诊断信息（供 /api/debug 排查）
+_webview_force = False   # 置 True 时后台 _loop 立即重抓一次（设置页"同步"触发）
 
 # ---- 本地接口防护：每次运行生成随机 secret，用于非白名单来源的写操作 ----
 _local_secret = secrets.token_hex(16)
@@ -957,6 +958,8 @@ def fetch_subscription_manual(cfg: dict) -> tuple:
 
 def _store_subscription(norm: dict, source: str) -> None:
     """归一化结果落缓存 + 内存（token 永不过到这里）。"""
+    _webview_dbg["storeCount"] = _webview_dbg.get("storeCount", 0) + 1
+    _webview_dbg["lastStoreAt"] = int(time.time())
     cache = load_cache()
     cache["subscription"] = {
         "data": norm, "fetchedAt": int(time.time() * 1000), "source": source,
@@ -1137,6 +1140,18 @@ def subscription_snapshot(cfg: dict, force=False) -> dict:
                 cached = dict(cached, message="手动同步失败：" + (err or ""))
     else:
         cached = _load_websub()
+        if force and _webview_active:
+            # webview 源：同步请求立即触发后台重抓一次，避免永远吃缓存
+            global _webview_force
+            _webview_force = True
+            # 给后台 _loop 一点时间完成重抓（最多 ~3s），让本次同步能返回新数据
+            mark = cached.get("fetchedAt", 0) if cached else 0
+            for _ in range(15):
+                time.sleep(0.2)
+                fresh = _load_websub()
+                if fresh and fresh.get("fetchedAt", 0) != mark:
+                    cached = fresh
+                    break
     if not cached or not cached.get("data"):
         return {"ok": False, "enabled": True,
                 "message": "尚无月额度数据：在设置页「连接 Kimi」登录，或安装浏览器扩展自动同步",
@@ -1251,7 +1266,14 @@ def run_connect_webview(port: int) -> None:
         // 是否找到 account token（仅布尔，不暴露 token 本身）
         authFound:(function(){var a=accountAuth();return a?'yes':'no';})(),
         // 总量 Code 段宽度（调试用，仅数字）
-        codeRatio:(function(){var v=(typeof codeRatioFromBar==='function')?codeRatioFromBar():null;return v!=null?v:'none';})()
+        codeRatio:(function(){var v=(typeof codeRatioFromBar==='function')?codeRatioFromBar():null;return v!=null?v:'none';})(),
+        // 诊断：5h / 7d 原始文本段（排查限额读错）
+        segSnips:(function(){try{
+          var t=document.body?document.body.innerText:'';
+          var i5=t.indexOf('\u5c0f\u65f6\u7528\u91cf'),i7=t.indexOf('\u5929\u7528\u91cf');
+          var out={h5:(i5>=0&&i7>i5)?t.slice(i5,i5+120):'no h5 seg',d7:(i7>=0)?t.slice(i7,i7+120):'no d7 seg'};
+          return out;
+        }catch(e){return {err:String(e)};}})()
       };
       return null;
       // ---- helpers ----
@@ -1440,78 +1462,95 @@ def run_connect_webview(port: int) -> None:
         pass
 
     def _loop(window):
+        global _webview_force
         got = False
         # 轮询退出条件：全局停止（清除登录）或 用户关窗
         while not _webview_stop and not closed["by_user"]:
             _webview_dbg["loopAt"] = int(_t.time())
-            # 主路径：Python 从 WebView 读 kimi-auth cookie（含 HttpOnly），内存内直接请求 API
-            norm = _fetch_via_cookie(window)
-            if norm is not None:
-                _store_subscription(norm, "webview")
-                state["fails"] = 0
-                state["lastOk"] = _t.time()
-                got = True
-                if not state["ok"]:
-                    state["ok"] = True
-                    _mark_session(True)
-                    try:
-                        window.hide()
-                    except Exception:
-                        pass
-            else:
-                # 兜底：页面内 DOM 抓取 / selfFetch（拿不到拆分字段但数值可用）
+            try:
+                # 设置页"同步"请求的强制刷新：任何状态下都立即响应，跳到本轮抓取
+                if _webview_force:
+                    _webview_force = False
+                    _webview_dbg["forceConsumed"] = int(_t.time())
+                # 主路径：Python 从 WebView 读 kimi-auth cookie（含 HttpOnly），内存内直接请求 API
                 try:
-                    res = window.evaluate_js(probe)
-                    if isinstance(res, str):
+                    norm = _fetch_via_cookie(window)
+                except Exception as _e:
+                    _webview_dbg["fetchErr"] = str(_e)[:160]
+                    norm = None
+                if norm is not None:
+                    _store_subscription(norm, "webview")
+                    state["fails"] = 0
+                    state["lastOk"] = _t.time()
+                    got = True
+                    if not state["ok"]:
+                        state["ok"] = True
+                        _mark_session(True)
                         try:
-                            obj = json.loads(res)
-                        except Exception:
-                            obj = None
-                        if obj and obj.get("ok") and obj.get("data"):
-                            handle_subscription_post(obj["data"], "webview")
-                            state["fails"] = 0
-                            state["lastOk"] = _t.time()
-                            got = True
-                            if not state["ok"]:
-                                state["ok"] = True
-                                _mark_session(True)
-                                try:
-                                    window.hide()
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    _webview_dbg["probeErr"] = str(e)[:160]
-                # 收集 WebView 内诊断信息（排查用）
-                # evaluate_js 会把 JS 对象自动转成 Python dict（不是 JSON 字符串），两种都兼容
-                try:
-                    dbg = window.evaluate_js("window.__kb_dbg")
-                    if isinstance(dbg, dict):
-                        _webview_dbg.update(dbg)
-                    elif isinstance(dbg, str):
-                        try:
-                            _webview_dbg.update(json.loads(dbg))
+                            window.hide()
                         except Exception:
                             pass
-                except Exception:
-                    pass
-            if state["ok"]:
-                _t.sleep(30 if got else 3)
-                got = False
-                if _webview_stop or closed["by_user"]:
-                    break
-                # 健康检查：超过 2.5 分钟没拿到新数据说明会话失效 → 弹窗重新登录
-                if _t.time() - state["lastOk"] > 150:
-                    state["fails"] += 1
                 else:
-                    state["fails"] = 0
-                if state["fails"] >= 3:
-                    state["ok"] = False
-                    state["fails"] = 0
+                    # 兜底：页面内 DOM 抓取 / selfFetch（拿不到拆分字段但数值可用）
                     try:
-                        window.show()
+                        res = window.evaluate_js(probe)
+                        if isinstance(res, str):
+                            try:
+                                obj = json.loads(res)
+                            except Exception:
+                                obj = None
+                            if obj and obj.get("ok") and obj.get("data"):
+                                handle_subscription_post(obj["data"], "webview")
+                                state["fails"] = 0
+                                state["lastOk"] = _t.time()
+                                got = True
+                                if not state["ok"]:
+                                    state["ok"] = True
+                                    _mark_session(True)
+                                    try:
+                                        window.hide()
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        _webview_dbg["probeErr"] = str(e)[:160]
+                    # 收集 WebView 内诊断信息（排查用）
+                    try:
+                        dbg = window.evaluate_js("window.__kb_dbg")
+                        if isinstance(dbg, dict):
+                            _webview_dbg.update(dbg)
+                        elif isinstance(dbg, str):
+                            try:
+                                _webview_dbg.update(json.loads(dbg))
+                            except Exception:
+                                pass
                     except Exception:
                         pass
-            else:
+                if state["ok"]:
+                    # 1s 分片睡眠，期间可被"设置页同步"的强制刷新打断
+                    _t.sleep(1)
+                    if _webview_force:
+                        continue  # 强制刷新已消费，立即进入下一轮抓取
+                    _t.sleep(29 if got else 2)
+                    got = False
+                    if _webview_stop or closed["by_user"]:
+                        break
+                    # 健康检查：超过 2.5 分钟没拿到新数据说明会话失效 → 弹窗重新登录
+                    if _t.time() - state["lastOk"] > 150:
+                        state["fails"] += 1
+                    else:
+                        state["fails"] = 0
+                    if state["fails"] >= 3:
+                        state["ok"] = False
+                        state["fails"] = 0
+                        try:
+                            window.show()
+                        except Exception:
+                            pass
+                else:
+                    _t.sleep(3)
+            except Exception as _e:
+                # 兜底：_loop 是 WebView 主线程回调，任何未捕获异常都会杀死整条刷新循环
+                _webview_dbg["loopErr"] = str(_e)[:160]
                 _t.sleep(3)
         # 退出分两种：
         #  · 用户关窗（closed["by_user"]）：只是不看，保留登录态，下次可自动重连 → 只 destroy
@@ -3850,6 +3889,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path.path == "/api/debug":
             dbg = dict(_webview_dbg,
                        webviewActive=_webview_active,
+                       webviewForce=_webview_force,
                        webviewSession=session_active(),
                        subscription=subscription_snapshot(CFG))
             body = json.dumps(dbg, ensure_ascii=False).encode("utf-8")
@@ -3881,7 +3921,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, "application/json; charset=utf-8",
                            json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
                 return
-            body = json.dumps(settings_state(), ensure_ascii=False).encode("utf-8")
+            # 保留 URL 里的 syncQuota/syncPrice 标志：同步按钮走 POST 时强制刷新
+            q = urllib.parse.parse_qs(path.query)
+            body = json.dumps(settings_state(sync_price="syncPrice" in q,
+                                             sync_quota="syncQuota" in q),
+                              ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         elif path.path.startswith("/api/subscription"):
             try:
