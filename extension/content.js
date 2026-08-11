@@ -28,22 +28,22 @@
 
   const icon = document.createElement("span");
   icon.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#2e6fe8" stroke-width="2.4" stroke-linejoin="round" aria-hidden="true"><polygon points="12,2.6 20.3,7.4 20.3,16.6 12,21.4 3.7,16.6 3.7,7.4"/></svg>';
-  Object.assign(icon.style, { display: "inline-flex", alignItems: "center", lineHeight: "0", alignSelf: "center" });
+  Object.assign(icon.style, { display: "inline-flex", alignItems: "center", lineHeight: "0", alignSelf: "center", flexShrink: "0" });
 
   const label = document.createElement("span");
   label.textContent = "本月";
-  Object.assign(label.style, { fontSize: "11px", color: "#9aa4b8", lineHeight: "1" });
+  Object.assign(label.style, { fontSize: "11px", color: "#9aa4b8", lineHeight: "1", whiteSpace: "nowrap", flexShrink: "0" });
 
   const cost = document.createElement("span");
   cost.textContent = "…";
   Object.assign(cost.style, {
     fontFamily: MONO, fontWeight: "700", fontSize: "12.5px", lineHeight: "1",
-    fontVariantNumeric: "tabular-nums", color: "#1c2433",
+    fontVariantNumeric: "tabular-nums", color: "#1c2433", whiteSpace: "nowrap",
   });
 
   const arrow = document.createElement("span");
   arrow.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#c3cad8" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9,6 15,12 9,18"/></svg>';
-  Object.assign(arrow.style, { display: "inline-flex", alignItems: "center", lineHeight: "0", marginLeft: "auto", alignSelf: "center" });
+  Object.assign(arrow.style, { display: "inline-flex", alignItems: "center", lineHeight: "0", marginLeft: "auto", alignSelf: "center", flexShrink: "0" });
 
   btn.append(icon, label, cost, arrow);
 
