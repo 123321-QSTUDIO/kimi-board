@@ -47,11 +47,13 @@
 
    ```bash
    cd 解压目录
-   chmod +x kimi-board start.sh
-   xattr -dr com.apple.quarantine kimi-board start.sh
+   chmod +x kimi-board *.sh
+   xattr -dr com.apple.quarantine .
    ```
-3. 终端执行 **`./start.sh`**，服务在后台启动并打开看板，
-   关掉终端窗口不影响运行；停止用 `pkill -f kimi-board`
+3. 终端执行 **`./install-autostart.sh`**（推荐）：立即启动服务并注册登录自启（launchd，
+   无需 root），以后每次开机自动运行；`./uninstall-autostart.sh` 可取消自启
+   - 只想临时用一次：终端执行 **`./start.sh`**，服务在后台启动并打开看板，
+     关掉终端窗口不影响运行；停止用 `pkill -f kimi-board`
 4. 浏览器扩展同样可用（见下方 [🧩 浏览器扩展](#-浏览器扩展推荐）)
 
 ## 🧩 浏览器扩展（推荐）

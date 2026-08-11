@@ -65,9 +65,9 @@ jobs:
           pkg="release/kimi-board"
           mkdir -p "$pkg"
           cp dist/kimi-board "$pkg/"
-          cp start.sh README.md LICENSE "$pkg/"
+          cp start.sh install-autostart.sh uninstall-autostart.sh README.md LICENSE "$pkg/"
           cp -r extension "$pkg/"
-          chmod +x "$pkg/kimi-board" "$pkg/start.sh"
+          chmod +x "$pkg/kimi-board" "$pkg/"*.sh
           cd release
           zip -r "kimi-board-${GITHUB_REF_NAME}-darwin-${{ matrix.arch }}.zip" kimi-board
 
