@@ -2033,16 +2033,23 @@ INDEX_HTML = """<!DOCTYPE html>
   .quota-row .q-used { font-family: var(--num); font-size: 26px; font-weight: 700; color: var(--text); }
   .quota-row .q-of { font-size: 12px; color: var(--dim); font-family: var(--mono); }
   .quota-row .q-pct { margin-left: auto; font-size: 14px; font-weight: 650; color: var(--blue-deep); font-family: var(--num); }
+  .quota-row .q-pct.warn { color: #e8833a; }
+  .quota-row .q-pct.danger { color: #e5484d; }
   .quota-row .q-track { height: 8px; background: #e6edf8; border-radius: 999px; overflow: hidden; margin-bottom: 10px; }
   .quota-row .q-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #5ea2ff, #2e6fe8); }
   .quota-row .q-fill.warn { background: linear-gradient(90deg, #ffb454, #ff7a3d); }
   .quota-row .q-fill.danger { background: linear-gradient(90deg, #ff7a3d, #e5484d); }
+  /* 拆分段：两段同色系，Kimi 浅 / KimiCode 深；末段右端圆角让填充末端自然收圆 */
   .quota-row .q-track.split { display: flex; overflow: hidden; }
-  .quota-row .q-track.split > div { height: 100%; border-radius: 0; }
+  .quota-row .q-track.split > div { height: 100%; }
   .quota-row .q-track.split > div:first-child { border-radius: 999px 0 0 999px; }
   .quota-row .q-track.split > div:last-child { border-radius: 0 999px 999px 0; }
-  .quota-row .q-track.split .kimi { background: #c9d4e6; }
+  .quota-row .q-track.split .kimi { background: #b9d6fc; }
   .quota-row .q-track.split .code { background: linear-gradient(90deg, #5ea2ff, #2e6fe8); }
+  .quota-row .q-track.split.warn .kimi { background: #ffd9ad; }
+  .quota-row .q-track.split.warn .code { background: linear-gradient(90deg, #ffb454, #ff7a3d); }
+  .quota-row .q-track.split.danger .kimi { background: #f5bcbc; }
+  .quota-row .q-track.split.danger .code { background: linear-gradient(90deg, #ff7a3d, #e5484d); }
   .quota-row .q-foot { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; color: var(--dim); }
   .quota-row .q-foot .num { font-family: var(--mono); color: var(--text); }
   .quota-empty { font-size: 12.5px; color: var(--faint); line-height: 1.9; }
@@ -2774,19 +2781,20 @@ function renderLimits(l) {
   }
   el.innerHTML = l.rows.map(r => {
     const pct = Math.min(100, r.pct);
+    // 用量 >=80 警示橙、>=95 危险红
     const cls = r.pct >= 95 ? " danger" : r.pct >= 80 ? " warn" : "";
     const eta = r.etaSeconds != null ? `预计 ${fmtDur(r.etaSeconds)} 后触顶` : "";
     const reset = r.resetTime ? `重置 ${new Date(r.resetTime).toLocaleString("zh-CN", {hour12: false})}` : "";
     const isSplit = r.kimiCodePct != null;
     const track = isSplit
-      ? `<div class="q-track split"><div class="kimi" style="width:${Math.min(100, r.kimiPct)}%"></div><div class="code" style="width:${Math.min(100, r.kimiCodePct)}%"></div></div>`
+      ? `<div class="q-track split${cls}"><div class="kimi" style="width:${Math.min(100, r.kimiPct)}%"></div><div class="code" style="width:${Math.min(100, r.kimiCodePct)}%"></div></div>`
       : `<div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>`;
     const detail = isSplit
       ? `<div class="q-foot"><span class="num">其中 Kimi ${pctStr(r.kimiPct, 2)} + KimiCode ${pctStr(r.kimiCodePct, 2)}</span></div>`
       : (r.detail ? `<div class="q-foot"><span class="num">${esc(r.detail)}</span></div>` : "");
     return `<div class="quota-row">
       <div class="q-head"><span class="q-name">${esc(r.name)}</span></div>
-      <div class="q-nums"><span class="q-used">${pctStr(r.used, 2)}</span><span class="q-of">已用</span><span class="q-pct">剩余 ${pctStr(Math.max(0, 100 - r.pct), 1)}</span></div>
+      <div class="q-nums"><span class="q-used">${pctStr(r.used, 2)}</span><span class="q-of">已用</span><span class="q-pct${cls}">剩余 ${pctStr(Math.max(0, 100 - r.pct), 1)}</span></div>
       ${track}
       <div class="q-foot"><span class="num">${esc(reset || "")}</span><span>${eta}</span></div>
       ${detail}
