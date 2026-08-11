@@ -770,6 +770,21 @@ _websub = {"at": 0.0, "data": None}  # 内存态，webview/extension 推送后�
 # 必须 private_mode=False 才会真正落盘（pywebview 默认 private_mode=True 用临时目录，不持久）。
 WEBVIEW_PROFILE_DIR = kimi_home() / "webview-profile"
 
+# 浏览器标签页 favicon：复用扩展图标（32px，HiDPI 下也清晰）。
+# 运行时读取一次，读不到就留空（页面仍可正常加载，只是没有图标）。
+def _load_favicon():
+    for name in ("32.png", "16.png", "48.png"):
+        p = Path(__file__).resolve().parent / "extension" / "icons" / name
+        try:
+            if p.exists():
+                return p.read_bytes()
+        except Exception:
+            pass
+    return None
+
+
+FAVICON_BYTES = _load_favicon()
+
 
 def _http_post_json(url: str, body: bytes, headers=None, timeout=8):
     req = urllib.request.Request(url, data=body, headers=headers or {}, method="POST")
@@ -1801,6 +1816,13 @@ def collect_stats():
     daily = [empty_usage() for _ in range(31)]
     hourly_models = [defaultdict(empty_usage) for _ in range(24)]
     daily_models = [defaultdict(empty_usage) for _ in range(31)]
+    # 本账期按"周期日"分桶：每个桶 = 从起算时刻起每 24h 一段（而不是按自然日 0 点切）。
+    # 桶 0 = month_start → month_start+24h，桶 1 = +24h→+48h ……
+    # 这样起算日当天不再被 0 点边界切成两半，每根柱子都精确等于一个周期日的用量，
+    # 总和与首页"本账期"(cards.month) 严格一致。
+    cycle_day_ms = 24 * 3600 * 1000
+    cycle_daily = []  # 动态扩展，索引即周期日序号
+    cycle_daily_models = []
     models_month = defaultdict(lambda: empty_usage())
     models_prev = defaultdict(lambda: empty_usage())
     turns = 0
@@ -1831,6 +1853,13 @@ def collect_stats():
                     i = (t - day_bucket0) // (86400 * 1000)
                     add(daily[i])
                     add(daily_models[i][model])
+                if month_start <= t < month_end:
+                    i = (t - month_start) // cycle_day_ms
+                    while i >= len(cycle_daily):
+                        cycle_daily.append(empty_usage())
+                        cycle_daily_models.append(defaultdict(empty_usage))
+                    add(cycle_daily[i])
+                    add(cycle_daily_models[i][model])
 
     def finalize(u):
         inp = u["inputOther"] + u["inputCacheRead"] + u["inputCacheCreation"]
@@ -1940,6 +1969,12 @@ def collect_stats():
                         if (v := finalize(mu)["total"]) > 0}}
             for i, u in enumerate(daily)
         ],
+        "cycleDaily": [
+            {"t": month_start + i * cycle_day_ms, **finalize(u),
+             "models": {m: v for m, mu in cycle_daily_models[i].items()
+                        if (v := finalize(mu)["total"]) > 0}}
+            for i, u in enumerate(cycle_daily)
+        ],
     }
 
 
@@ -1950,6 +1985,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/favicon.png">
 <title>Kimi Code 用量看板</title>
 <meta name="kb-secret" content="__KB_SECRET__">
 <style>
@@ -2102,6 +2138,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .card .label .hex { font-size: 13px; }
   .card .value { font-family: var(--num); font-size: 46px; font-weight: 700; letter-spacing: .01em; font-variant-numeric: tabular-nums; margin-bottom: 12px; }
+  .card .value .value-unit { font-size: 15px; font-weight: 600; color: var(--faint); margin-left: 8px; letter-spacing: .02em; }
   .card .sub { font-size: 13.5px; color: var(--dim); line-height: 2.0; }
   .card .sub .row { display: flex; justify-content: space-between; gap: 12px; }
   .card .sub .num { font-family: var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
@@ -2356,7 +2393,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <section class="trendcard reveal" style="animation-delay:120ms">
   <div class="sec-head">用量趋势
-    <span class="right seg" id="rangeSeg"><span class="seg-pill" aria-hidden="true"></span><button data-r="24h">24 小时</button><button data-r="7d" class="on">7 天</button><button data-r="30d">30 天</button><button data-r="mtd">本月</button></span>
+    <span class="right seg" id="rangeSeg"><span class="seg-pill" aria-hidden="true"></span><button data-r="24h">24 小时</button><button data-r="7d" class="on">7 天</button><button data-r="30d">30 天</button><button data-r="mtd">本月</button><button data-r="cycle">本账期</button></span>
   </div>
   <div class="trend-sum" id="trendSum"></div>
   <div class="trend-legend" id="trendLegend"></div>
@@ -2377,6 +2414,11 @@ const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches && localS
 const fmt = n => n.toLocaleString("en-US");
 const fmtK = n => n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\\.0$/, "") + "M"
              : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\\.0$/, "") + "K" : String(n);
+// 中文缩略单位（仅亿/万；<1万 返回空，不用显示）：
+// 627686630 -> "≈6.28亿"，62768 -> "≈6.3万"，9999 -> ""
+const fmtCN = n => n >= 1e8 ? "≈" + (n / 1e8).toFixed(2).replace(/\.?0+$/, "") + "亿"
+             : n >= 1e4 ? "≈" + (n / 1e4).toFixed(1).replace(/\.0$/, "") + "万"
+             : "";
 const yuan = n => "¥ " + n.toLocaleString("zh-CN", {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -2504,7 +2546,7 @@ function cardHtml(label, cap, c, tint) {
   const hitRate = c.input ? (c.cacheRead / c.input * 100).toFixed(1) : "0.0";
   return `<div class="card${tint ? " tint" : ""}">
     <div class="label"><span class="hex">⬡</span>${label}</div>
-    <div class="value" data-v="${c.total}">0</div>
+    <div class="value" data-v="${c.total}"><span class="value-num">0</span>${fmtCN(c.total) ? `<span class="value-unit">${fmtCN(c.total)}</span>` : ""}</div>
     <div class="sub">
       <div class="row"><span>输入</span><span class="num">${fmt(c.input)}</span></div>
       <div class="row"><span>其中缓存读取</span><span class="num">${fmt(c.cacheRead)}</span></div>
@@ -2552,6 +2594,14 @@ function trendPoints() {
   if (TREND.range === "24h") return { pts: d.hourly, kind: "hour" };
   if (TREND.range === "7d") return { pts: d.daily.slice(-7), kind: "day" };
   if (TREND.range === "30d") return { pts: d.daily.slice(-30), kind: "day" };
+  // 本账期：后端 cycleDaily 已按精确周期边界 [cycleStart, cycleEnd) 只计入周期内事件，
+  // 起算日当天(部分时段)也正确归入当天的桶。这里不要再按 t>=cycleStart 过滤——
+  // 起算日 00:00 的桶时间戳早于 cycleStart，但桶内全是本周期数据，过滤会整桶丢。
+  // 只需保留有数据的桶即可，总和与首页"本账期"卡片严格一致。
+  if (TREND.range === "cycle") {
+    const pts = (d.cycleDaily || []).filter(p => p.total > 0);
+    return { pts, kind: "day" };
+  }
   const now = new Date();
   const pts = d.daily.filter(p => {
     const dt = new Date(p.t);
@@ -2590,9 +2640,10 @@ function renderTrend() {
   }
   const avg = pts.length ? Math.round(tot / pts.length) : 0;
   document.getElementById("trendSum").innerHTML = `
-    <div class="ts"><span class="lb">合计</span><span class="vl"><b id="tsTotal">0</b><span class="unit">tokens</span></span></div>
+    <div class="ts"><span class="lb">合计</span><span class="vl"><b id="tsTotal">0</b><span class="unit">Tokens</span></span></div>
     <div class="ts"><span class="lb">峰值</span><span class="vl"><b>${fmtK(peak.total)}</b><span class="unit">${esc(kind === "hour" ? trendLabel(peak, kind, true).slice(5) : trendLabel(peak, kind, true))}</span></span></div>
-    <div class="ts"><span class="lb">${kind === "hour" ? "时均" : "日均"}</span><span class="vl"><b>${fmtK(avg)}</b><span class="unit">tokens</span></span></div>`;
+    <div class="ts"><span class="lb">${kind === "hour" ? "时均" : "日均"}</span><span class="vl"><b>${fmtK(avg)}</b><span class="unit">Tokens</span></span></div>`;
+  // 合计沿用原来的紧凑显示（M/K）
   countUp(document.getElementById("tsTotal"), tot, v => fmtK(Math.round(v)));
   document.getElementById("trendLegend").innerHTML = TREND.order
     .filter(m => modelSums[m] > 0)
@@ -2790,7 +2841,7 @@ function renderLimits(l) {
       ? `<div class="q-track split${cls}"><div class="kimi" style="width:${Math.min(100, r.kimiPct)}%"></div><div class="code" style="width:${Math.min(100, r.kimiCodePct)}%"></div></div>`
       : `<div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>`;
     const detail = isSplit
-      ? `<div class="q-foot"><span class="num">其中 Kimi ${pctStr(r.kimiPct, 2)} + KimiCode ${pctStr(r.kimiCodePct, 2)}</span></div>`
+      ? `<div class="q-foot"><span class="num">其中 Kimi ${pctStr(r.kimiPct, 2)} | KimiCode ${pctStr(r.kimiCodePct, 2)}</span></div>`
       : (r.detail ? `<div class="q-foot"><span class="num">${esc(r.detail)}</span></div>` : "");
     return `<div class="quota-row">
       <div class="q-head"><span class="q-name">${esc(r.name)}</span></div>
@@ -2821,7 +2872,7 @@ async function load() {
       cardHtml("今日", "USAGE · 02 TODAY", d.cards.today, false) +
       cardHtml("近 1 小时", "USAGE · 03 HOUR", d.cards.hour, false);
     document.querySelectorAll("#cards .value").forEach(el =>
-      countUp(el, +el.dataset.v, v => fmt(Math.round(v))));
+      countUp(el.querySelector(".value-num"), +el.dataset.v, v => fmt(Math.round(v))));
 
     countUp(document.getElementById("costTotal"), c.monthTotal, yuan);
     document.getElementById("costBreakdown").innerHTML = `
@@ -2907,6 +2958,7 @@ SETTINGS_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/favicon.png">
 <title>Kimi Board · 设置</title>
 <meta name="kb-secret" content="__KB_SECRET__">
 <style>
@@ -3526,6 +3578,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path.path == "/settings":
             body = SETTINGS_HTML.replace("__KB_SECRET__", _local_secret).encode("utf-8")
             self._send(200, "text/html; charset=utf-8", body)
+        elif path.path == "/favicon.png":
+            if FAVICON_BYTES:
+                self._send(200, "image/png", FAVICON_BYTES)
+            else:
+                self._send(404, "text/plain", b"no favicon")
         elif path.path.startswith("/api/stats"):
             body = json.dumps(collect_stats(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
