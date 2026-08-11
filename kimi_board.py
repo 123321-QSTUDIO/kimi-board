@@ -990,17 +990,107 @@ def run_connect_webview(port: int) -> None:
         import webview
     except ImportError:
         return
-    probe = """(function(){
-      if (window.__kb_sub) return JSON.stringify(window.__kb_sub);
-      (async function(){
-        try {
-          var r = await fetch('%s', {method:'POST',
-            headers:{'Content-Type':'application/json'}, body:'{}', credentials:'include'});
-          window.__kb_sub = r.ok ? {ok:true, data:await r.text()} : {ok:false, status:r.status};
-        } catch(e){ window.__kb_sub = {ok:false, err:String(e)}; }
-      })();
+    probe = r"""(function(){
+      var U='%s';
+      function capture(o){
+        if(o&&(o.subscriptionBalance||o.ratelimitCode5h)) window.__kb_sub={ok:true,data:JSON.stringify(o)};
+      }
+      // 1) 钩子：站点自己请求 GetSubscriptionStats 时，捕获其响应（和请求头）
+      if(!window.__kb_hooked){
+        window.__kb_hooked=true; window.__kb_hdrs=null;
+        try{
+          var of=window.fetch;
+          window.fetch=function(url,opts){
+            var u=typeof url==='string'?url:(url&&url.url);
+            if(u&&u.indexOf('GetSubscriptionStats')!==-1){
+              if(opts&&opts.headers){
+                try{var h=opts.headers,o={};
+                  if(h&&typeof h.forEach==='function'){h.forEach(function(v,k){o[k]=v;});}
+                  else{for(var k in h){o[k]=h[k];}}
+                  window.__kb_hdrs=o;}catch(e){}
+              }
+              var p=of.apply(this,arguments);
+              p.then(function(r){r.clone().text().then(function(t){try{capture(JSON.parse(t));}catch(e){}}).catch(function(){});}).catch(function(){});
+              return p;
+            }
+            return of.apply(this,arguments);
+          };
+        }catch(e){}
+        try{
+          var ox=XMLHttpRequest.prototype.open,os=XMLHttpRequest.prototype.send;
+          XMLHttpRequest.prototype.open=function(m,u){this.__kb_url=u;return ox.apply(this,arguments);};
+          XMLHttpRequest.prototype.send=function(){
+            var x=this;
+            this.addEventListener('load',function(){
+              try{if(x.__kb_url&&x.__kb_url.indexOf('GetSubscriptionStats')!==-1){capture(JSON.parse(x.responseText));}}catch(e){}
+            });
+            return os.apply(this,arguments);
+          };
+        }catch(e){}
+      }
+      if(window.__kb_sub) return JSON.stringify(window.__kb_sub);
+      // 2) DOM 兜底：直接从页面显示的额度文字提取（登录后页面必然展示）
+      try{
+        var d=scrapeDom();
+        if(d){ window.__kb_sub={ok:true,data:JSON.stringify(d)}; return JSON.stringify(window.__kb_sub); }
+      }catch(e){}
+      // 3) 兜底按钮
+      if(!document.getElementById('kb-sync-done')){
+        var b=document.createElement('div');
+        b.id='kb-sync-done';
+        b.style.cssText='position:fixed;z-index:2147483647;left:16px;top:16px;background:#2e6fe8;color:#fff;border:0;border-radius:10px;padding:10px 16px;font:600 13px/1 "PingFang SC",system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(20,40,80,.25);user-select:none';
+        b.textContent='\u2713 \u6211\u5df2\u767b\u5f55\uff0c\u540c\u6b65\u5e76\u5173\u95ed';
+        b.onclick=function(){
+          b.textContent='\u540c\u6b65\u4e2d...';
+          selfFetch(function(ok,msg){ b.textContent=ok?'\u5df2\u540c\u6b65\uff0c\u5373\u5c06\u5173\u95ed':'\u5931\u8d25\uff1a'+msg; });
+        };
+        try{document.body.appendChild(b);}catch(e){}
+      }
+      // 4) 自己再试（复用站点捕获的请求头）
+      selfFetch(function(){});
       return null;
-    })()""" % SUBSTATS_URL
+      // ---- helpers ----
+      function selfFetch(cb){
+        var hdrs={'Content-Type':'application/json'};
+        // 复用站点自己请求时捕获到的请求头（含 Authorization、x-msh-*）
+        try{if(window.__kb_hdrs){for(var k in window.__kb_hdrs){hdrs[k]=window.__kb_hdrs[k];}}}catch(e){}
+        // 兜底：直接从 cookie 读 kimi-auth JWT，补 Authorization 头（JWT 仍在 WebView 内，不外泄）
+        if(!hdrs['authorization']&&!hdrs['Authorization']){
+          try{
+            var cs=document.cookie.split(';'),jt=null;
+            for(var i=0;i<cs.length;i++){var p=cs[i].trim();if(p.indexOf('kimi-auth=')===0){jt=p.slice(10);break;}}
+            if(jt) hdrs['Authorization']='Bearer '+jt;
+          }catch(e){}
+        }
+        (function(){
+          fetch(U,{method:'POST',headers:hdrs,body:'{}',credentials:'include'})
+            .then(function(r){return r.ok?r.text():Promise.reject('HTTP '+r.status);})
+            .then(function(t){try{var o=JSON.parse(t);capture(o);cb(true,'ok');}catch(e){cb(false,'parse');}})
+            .catch(function(e){window.__kb_sub=null;cb(false,String(e));});
+        })();
+      }
+      function numIn(src,re){var m=src.match(re);return m?parseFloat(m[1]):null;}
+      function seg(a,b){var i=document.body.innerText.indexOf(a),j=document.body.innerText.indexOf(b);
+        return (i>=0&&j>i)?document.body.innerText.slice(i,j):'';}
+      function scrapeDom(){
+        var t=document.body?document.body.innerText:'';
+        var used=numIn(t,/[\u603b\u4f7f\u7528\u91cf][^\d]*([\d.]+)%%/);      // 总使用量
+        var h5s=seg('\u5c0f\u65f6\u7528\u91cf','\u5929\u7528\u91cf');        // 小时用量~天用量
+        var d7s=seg('\u5929\u7528\u91cf','\u989d\u5ea6\u52a0\u6cb9\u5305');  // 天用量~额度加油包
+        var h5=numIn(h5s,/Code[^\d]*([\d.]+)%%/i);
+        var d7=numIn(d7s,/Code[^\d]*([\d.]+)%%/i);
+        var r5=/\d{2}-\d{2}\s*\d{2}:\d{2}/.exec(h5s);
+        var r7=/\d{2}-\d{2}\s*\d{2}:\d{2}/.exec(d7s);
+        var ex=/\u7eed\u8d39\u65f6\u95f4[^\d]*(\d{4}-\d{2}-\d{2})/.exec(t);  // 续费时间
+        if(used==null&&h5==null&&d7==null) return null;
+        function iso(s){ if(!s) return null; var y=new Date().getFullYear(); return y+'-'+s.replace(' ','T')+':00'; }
+        return {
+          subscriptionBalance:{amountUsedRatio:used!=null?used/100:null,expireTime:ex?ex[1]+'T00:00:00Z':null},
+          ratelimitCode5h:{ratio:h5!=null?h5/100:null,resetTime:iso(r5?r5[0]:null)},
+          ratelimitCode7d:{ratio:d7!=null?d7/100:null,resetTime:iso(r7?r7[0]:null)}
+        };
+      }
+    })()""" % (SUBSTATS_URL,)
     state = {"done": False, "data": None}
 
     def _loop(window):
@@ -1104,6 +1194,53 @@ def _open_connect() -> dict:
         return {"ok": True, "message": "已打开登录窗口，请在弹出的 Kimi 页面登录"}
     except Exception:
         return {"ok": False, "message": "登录窗口队列异常"}
+
+
+def _limit_row(name, used_pct, reset_time=None, eta=None, detail=None):
+    """统一限额行：全部按百分比展示（limit=100）。used_pct 为 0-100 的已用百分比。"""
+    return {
+        "name": name, "kind": "percent", "limit": 100,
+        "used": round(float(used_pct), 2) if used_pct is not None else None,
+        "pct": round(min(float(used_pct), 100.0), 2) if used_pct is not None else 0.0,
+        "resetTime": reset_time, "etaSeconds": eta, "detail": detail,
+    }
+
+
+def integrated_limits(cfg: dict) -> dict:
+    """整合限额展示，数据源回退链：
+    1) 官网 GetSubscriptionStats（登录后，百分比精确到两位小数：月额度 / 5h / 周 + 官方提示）
+    2) 无官网登录 → KimiCode 同步（本地 kimi web → 云端 API，整数百分比：周 / 5h）
+    """
+    official = subscription_snapshot(cfg)
+    if official.get("ok") and official.get("data"):
+        d = official["data"]
+        rows = []
+        if d.get("amountUsedRatio") is not None:
+            detail = None
+            if d.get("kimiCodeUsedRatio") is not None:
+                detail = f"KimiCode 占月额 {d['kimiCodeUsedRatio'] * 100:.1f}%"
+            rows.append(_limit_row("月额度（官网订阅）", d["amountUsedRatio"] * 100,
+                                   d.get("expireTime"), detail=detail))
+        l5 = d.get("limits5h") or {}
+        if l5.get("ratio") is not None:
+            rows.append(_limit_row("5 小时限额", l5["ratio"] * 100, l5.get("resetTime")))
+        l7 = d.get("limits7d") or {}
+        if l7.get("ratio") is not None:
+            rows.append(_limit_row("周限额", l7["ratio"] * 100, l7.get("resetTime")))
+        notice = None
+        if d.get("notice"):
+            notice = d["notice"].get("tip") or d["notice"].get("content")
+        return {"ok": True, "source": "official", "rows": rows, "notice": notice,
+                "fetchedAt": official.get("fetchedAt")}
+    # 回退：KimiCode 同步（本地 kimi web → 云端），整数百分比
+    quota = quota_snapshot(cfg)
+    if quota.get("ok"):
+        rows = [_limit_row(r.get("name", "限额"), r.get("pct", 0), r.get("resetAt"),
+                           r.get("etaSeconds")) for r in quota.get("rows", [])]
+        return {"ok": True, "source": quota.get("source", "kimi"), "rows": rows,
+                "notice": None, "fetchedAt": quota.get("fetchedAt")}
+    return {"ok": False, "source": None, "rows": [], "notice": None,
+            "message": quota.get("message") or official.get("message") or "暂无限额数据"}
 
 
 def cycle_bounds(now: datetime, cfg: dict) -> dict:
@@ -1367,6 +1504,13 @@ def collect_stats():
     except Exception:
         subscription = {"ok": False, "enabled": True, "message": "月额度同步异常", "data": None}
 
+    # ---- 整合限额：官网(百分比) → KimiCode(百分比，本地→云端) ----
+    try:
+        limits = integrated_limits(cfg)
+    except Exception:
+        limits = {"ok": False, "source": None, "rows": [], "notice": None,
+                  "message": "限额整合异常"}
+
     return {
         "generatedAt": now_ms,
         "turns": turns,
@@ -1396,6 +1540,7 @@ def collect_stats():
         "pricing": pricing_info(),
         "quota": quota,
         "subscription": subscription,
+        "limits": limits,
         "billing": {
             "day": cfg["billing"]["day"],
             "hour": cfg["billing"]["hour"],
@@ -1785,12 +1930,11 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="cards reveal" id="cards" style="animation-delay:40ms"></div>
 
 <section class="quota reveal" id="quotaSec" style="animation-delay:60ms">
-  <div class="sec-head">官方限额（5 小时 / 周）
+  <div class="sec-head">官方限额
     <span class="right" id="quotaMeta"></span>
   </div>
   <div class="quota-rows" id="quotaRows"></div>
-  <div class="quota-rows" id="subRows" style="margin-top:14px"></div>
-  <div class="caption">QUOTA · 官方接口同步 · 每次刷新自动更新</div>
+  <div class="caption">QUOTA · 官网百分比(两位) → KimiCode(整数) 自动回退 · 每次刷新自动更新</div>
 </section>
 
 <div class="blackcard reveal" style="animation-delay:80ms">
@@ -2220,70 +2364,42 @@ function renderPricing(p) {
     `${esc(p.message || "")}${p.fetchedAt ? " · " + new Date(p.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false}) : ""} · 缓存创建按输入价计`;
 }
 
-function renderQuota(q) {
+function pctStr(v, dp) {
+  if (v == null) return "--";
+  const n = dp ? +(+v).toFixed(dp) : Math.round(v * 10) / 10;
+  return (n % 1 === 0 ? n : n.toFixed(2).replace(/\.?0+$/, "")) + "%";
+}
+function renderLimits(l) {
   const meta = document.getElementById("quotaMeta");
   const el = document.getElementById("quotaRows");
-  if (!q.enabled) {
+  if (!l || !l.ok) {
     meta.textContent = "";
-    el.innerHTML = `<div class="quota-empty">配额同步已关闭，可在 <a href="/settings">设置</a> 中开启。</div>`;
+    el.innerHTML = `<div class="quota-empty">暂无限额数据：${esc((l && l.message) || "")}<br>
+      可在 <a href="/settings">设置</a> 「连接 Kimi」登录官网拿精确百分比，或确认 kimi web / 已登录。</div>`;
     return;
   }
-  if (!q.ok) {
-    meta.textContent = "";
-    el.innerHTML = `<div class="quota-empty">无法获取官方限额：${esc(q.message || "")}<br>
-      请在 <a href="/settings">设置</a> 检查同步来源，确认已 <code>kimi login</code> 且 kimi web 在运行。</div>`;
-    return;
-  }
-  meta.textContent = `同步于 ${new Date(q.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false})} · ${q.source === "cloud" ? "云端" : "本地"}接口`;
-  if (!q.rows.length) {
+  const srcTxt = {official: "官网 · 百分比(两位)", local: "KimiCode · 本机", cloud: "KimiCode · 云端"}[l.source] || l.source;
+  meta.textContent = `${srcTxt} · 同步于 ${new Date(l.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false})}`;
+  if (!l.rows.length) {
     el.innerHTML = `<div class="quota-empty">官方未返回限额数据（账号 / 地区可能不适用）。</div>`;
     return;
   }
-  el.innerHTML = q.rows.map(r => {
+  el.innerHTML = l.rows.map(r => {
     const pct = Math.min(100, r.pct);
     const cls = r.pct >= 95 ? " danger" : r.pct >= 80 ? " warn" : "";
-    const w = r.window;
-    const wnd = w ? (w[1] === "hour" ? `${w[0]} 小时` : w[1] === "week" ? `${w[0]} 周` : `${w[0]} ${w[1]}`) : "";
     const eta = r.etaSeconds != null ? `预计 ${fmtDur(r.etaSeconds)} 后触顶` : "";
-    const reset = r.resetAt ? `重置 ${new Date(r.resetAt).toLocaleString("zh-CN", {hour12: false})}` : "";
+    const reset = r.resetTime ? `重置 ${new Date(r.resetTime).toLocaleString("zh-CN", {hour12: false})}` : "";
     return `<div class="quota-row">
-      <div class="q-head"><span class="q-name">${esc(r.name || "限额")}</span><span class="q-window">${esc(wnd)}</span></div>
-      <div class="q-nums"><span class="q-used">${fmt(r.used)}</span><span class="q-of">/ ${fmt(r.limit)} tokens</span><span class="q-pct">${r.pct}%</span></div>
+      <div class="q-head"><span class="q-name">${esc(r.name)}</span></div>
+      <div class="q-nums"><span class="q-used">${pctStr(r.used, 2)}</span><span class="q-of">已用</span><span class="q-pct">剩余 ${pctStr(Math.max(0, 100 - r.pct), 1)}</span></div>
       <div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>
-      <div class="q-foot"><span class="num">剩余 ${fmt(Math.max(0, r.limit - r.used))}</span><span>${eta}</span></div>
-      ${reset ? `<div class="q-foot"><span></span><span class="num">${esc(reset)}</span></div>` : ""}
+      <div class="q-foot"><span class="num">${esc(reset || "")}</span><span>${eta}</span></div>
+      ${r.detail ? `<div class="q-foot"><span class="num">${esc(r.detail)}</span></div>` : ""}
     </div>`;
   }).join("");
-}
-
-function renderSubscription(s) {
-  const el = document.getElementById("subRows");
-  if (!s || !s.enabled) { el.innerHTML = ""; return; }
-  if (!s.ok || !s.data) {
-    el.innerHTML = `<div class="quota-empty">月额度未同步：${esc((s && s.message) || "暂无数据")}<br>
-      点看板右上角「设置」→「连接 Kimi」用内置窗口登录一次，或安装浏览器扩展自动同步。</div>`;
-    return;
+  if (l.notice) {
+    el.innerHTML += `<div class="quota-empty" style="margin-top:12px">${esc(l.notice)}</div>`;
   }
-  const d = s.data;
-  const srcTxt = {manual: "手动 Token", webview: "WebView", extension: "扩展"}[s.source] || s.source;
-  const ratio = d.amountUsedRatio != null ? d.amountUsedRatio * 100 : null;
-  const pct = ratio == null ? 0 : Math.min(100, ratio);
-  const cls = ratio >= 90 ? " danger" : ratio >= 70 ? " warn" : "";
-  const r5 = d.limits5h || {}, r7 = d.limits7d || {};
-  const note = d.notice ? (d.notice.tip || d.notice.content || "") : "";
-  const expire = d.expireTime ? `重置 ${new Date(d.expireTime).toLocaleString("zh-CN", {hour12: false})}` : "";
-  const foot = [];
-  if (r5.ratio != null) foot.push(`5h 已用 ${(r5.ratio * 100).toFixed(1)}%`);
-  if (r7.ratio != null) foot.push(`7d 已用 ${(r7.ratio * 100).toFixed(1)}%`);
-  if (d.kimiCodeUsedRatio != null) foot.push(`KimiCode 占月额 ${(d.kimiCodeUsedRatio * 100).toFixed(1)}%`);
-  el.innerHTML = `<div class="quota-row" style="grid-column:1/-1">
-    <div class="q-head"><span class="q-name">月额度（官网订阅）</span>
-      <span class="q-window">同步于 ${new Date(s.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false})} · ${srcTxt}</span></div>
-    <div class="q-nums"><span class="q-used">${ratio == null ? "--" : ratio.toFixed(1)}%</span>
-      <span class="q-of">月额度已用</span><span class="q-pct">${expire ? esc(expire) : ""}</span></div>
-    <div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>
-    <div class="q-foot">${note ? `<span class="num">${esc(note)}</span>` : "<span></span>"}<span>${foot.join(" · ")}</span></div>
-  </div>`;
 }
 
 async function load() {
@@ -2312,8 +2428,7 @@ async function load() {
     document.getElementById("payback").innerHTML = paybackHtml(c);
     modelCostList(document.getElementById("modelCost"), c.byModel);
     renderPricing(d.pricing);
-    renderQuota(d.quota);
-    renderSubscription(d.subscription);
+    renderLimits(d.limits);
 
     TREND.data = d;
     const _sums = {};
@@ -3006,10 +3121,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass  # 浏览器提前关闭连接，属正常噪音
 
     def log_message(self, *args):
         pass
+
+
+class QuietHTTPServer(ThreadingHTTPServer):
+    """吞掉客户端中断连接的异常，避免刷屏。"""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, BrokenPipeError, OSError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def main():
@@ -3076,7 +3204,7 @@ def main():
                                      fetch_quota(CFG, force=True)),
                      daemon=True).start()
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = QuietHTTPServer((args.host, args.port), Handler)
     SERVER_PORT = args.port
     url = f"http://{args.host}:{args.port}"
     print(f"kimi code token 看板已启动：{url}  (Ctrl+C 停止)")
