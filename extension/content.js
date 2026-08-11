@@ -31,7 +31,7 @@
   Object.assign(icon.style, { display: "inline-flex", alignItems: "center", lineHeight: "0", alignSelf: "center", flexShrink: "0" });
 
   const label = document.createElement("span");
-  label.textContent = "本月";
+  label.textContent = "本账期";
   Object.assign(label.style, { fontSize: "11px", color: "#9aa4b8", lineHeight: "1", whiteSpace: "nowrap", flexShrink: "0" });
 
   const cost = document.createElement("span");
@@ -41,21 +41,36 @@
     fontVariantNumeric: "tabular-nums", color: "#1c2433", whiteSpace: "nowrap",
   });
 
+  const price = document.createElement("span");
+  price.textContent = "";
+  Object.assign(price.style, {
+    fontFamily: MONO, fontWeight: "500", fontSize: "10.5px", lineHeight: "1",
+    color: "#8b96a8", whiteSpace: "nowrap", flexShrink: "0",
+  });
+
   const arrow = document.createElement("span");
   arrow.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#c3cad8" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9,6 15,12 9,18"/></svg>';
   Object.assign(arrow.style, { display: "inline-flex", alignItems: "center", lineHeight: "0", marginLeft: "auto", alignSelf: "center", flexShrink: "0" });
 
-  btn.append(icon, label, cost, arrow);
+  btn.append(icon, label, cost, price, arrow);
 
   let alive = false;
 
   function setOffline() {
     alive = false;
     label.style.display = "none";
+    price.textContent = "";
     cost.textContent = "看板未启动";
     Object.assign(cost.style, {
       fontFamily: FONT, fontWeight: "500", fontSize: "12px", color: "#9aa4b8",
     });
+  }
+
+  // 中文缩略：≥亿 用"亿"，≥万 用"万"（与看板一致），<1万 返回完整数字
+  function fmtCN(n) {
+    if (n >= 1e8) return (n / 1e8).toFixed(2).replace(/\.?0+$/, "") + "亿";
+    if (n >= 1e4) return (n / 1e4).toFixed(1).replace(/\.0$/, "") + "万";
+    return String(Math.round(n));
   }
 
   async function refresh() {
@@ -63,13 +78,19 @@
       const d = await (await fetch(DASH + "/api/stats", { cache: "no-store" })).json();
       alive = true;
       label.style.display = "";
+      // 标签跟随看板计费周期（含 cc-switch 合并的量）：本账期 · 起算日 MM-DD
+      const cs = d.cost || {};
+      const cl = (cs.cycleLabel || "").slice(0, 5);  // "07-20 11:22" -> "07-20"
+      label.textContent = "本账期" + (cl ? " " + cl : "");
       const t = d.cards.month.total;
-      cost.textContent = (t >= 1e6 ? (t / 1e6).toFixed(1).replace(/\.0$/, "") + "M"
-                        : t >= 1e3 ? (t / 1e3).toFixed(1).replace(/\.0$/, "") + "K"
-                        : String(t)) + " tokens";
+      cost.textContent = fmtCN(t) + " tokens";
+      price.textContent = (cs.monthTotal != null && cs.monthTotal > 0)
+        ? "≈¥" + (cs.monthTotal >= 10000 ? (cs.monthTotal / 10000).toFixed(2).replace(/\.?0+$/, "") + "万" : cs.monthTotal.toFixed(0))
+        : "";
       Object.assign(cost.style, {
         fontFamily: MONO, fontWeight: "700", fontSize: "12.5px", color: "#1c2433",
       });
+      btn.title = `本账期起算 ${cs.cycleStart ? new Date(cs.cycleStart).toLocaleString("zh-CN", {hour12: false}) : ""}\n已用 ${fmtCN(t)} tokens · 等效费用 ≈¥${cs.monthTotal != null ? cs.monthTotal.toFixed(2) : "--"}\n含 cc-switch 合并的 KimiCode 用量`;
     } catch {
       setOffline();
     }
