@@ -572,23 +572,19 @@ def _normalize_rows(rows: list) -> list:
             continue
         row = {"name": name, "window": window, "used": used, "limit": limit,
                "resetAt": reset_at, "pct": round(used / limit * 100, 1)}
-        # 推算：以窗口内平均速率估计到达限额的时间
+        # 推算：以窗口内平均速率估计触顶时间（仅在窗口重置前可触顶时给出）
         window_sec = None
         if window and window[1] == "hour":
             window_sec = window[0] * 3600
         elif window and window[1] == "week":
             window_sec = window[0] * 7 * 86400
-        dt = _parse_reset_at(reset_at)
-        if window_sec and dt:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            remaining = (dt - datetime.now().astimezone()).total_seconds()
-            elapsed = max(1.0, window_sec - remaining)
-            rate = used / elapsed
-            if rate > 0:
-                row["etaSeconds"] = int((limit - used) / rate)
-            else:
-                row["etaSeconds"] = None
+        used_pct = used / limit * 100
+        est = _estimate_eta(used_pct, reset_at, window_sec,
+                            datetime.now().astimezone()) if window_sec else None
+        if est:
+            row["etaSeconds"] = est["etaSeconds"]
+            row["willHit"] = est["willHit"]
+            row["resetIn"] = est["resetIn"]
         out.append(row)
     return out
 
@@ -765,6 +761,12 @@ SUBSTATS_MANUAL_HEADERS = {
     "x-msh-version": "2.0.0",
 }
 _websub = {"at": 0.0, "data": None}  # 内存态，webview/extension 推送后更新（已归一化）
+
+# 近期速率上下文：collect_stats 每次扫描后写入，integrated_limits 读取。
+# 键: recent15/30/60 = 近 15/30/60 分钟 token 总量；monthTotal = 本周期 token 总量；
+#     5hTotal / 7dTotal = 近 5h / 7d 滚动窗口 token 总量（按自然时间窗口近似）。
+_rate_ctx = {"recent15": 0, "recent30": 0, "recent60": 0,
+             "monthTotal": 0, "h5Total": 0, "d7Total": 0}
 
 # WebView2 专属持久 profile：Cookie/JWT/localStorage 都留在这里，随 KIMI_CODE_HOME 走。
 # 必须 private_mode=False 才会真正落盘（pywebview 默认 private_mode=True 用临时目录，不持久）。
@@ -1590,6 +1592,17 @@ def _open_connect() -> dict:
         return {"ok": False, "message": "登录窗口队列异常"}
 
 
+def _apply_est(row: dict, est: dict) -> dict:
+    """把 _estimate_eta 的结果合并进限额行，供 tooltip 展示估算明细。"""
+    row["etaSeconds"] = est.get("etaSeconds")
+    row["willHit"] = est.get("willHit")
+    row["resetIn"] = est.get("resetIn")
+    for k in ("windowSec", "usedPct", "elapsedSec", "remainingSec", "ratePctPerSec",
+              "rateSource", "recentLabel"):
+        row[k] = est.get(k)
+    return row
+
+
 def _limit_row(name, used_pct, reset_time=None, eta=None, detail=None):
     """统一限额行：全部按百分比展示（limit=100）。used_pct 为 0-100 的已用百分比。"""
     return {
@@ -1598,6 +1611,90 @@ def _limit_row(name, used_pct, reset_time=None, eta=None, detail=None):
         "pct": round(min(float(used_pct), 100.0), 2) if used_pct is not None else 0.0,
         "resetTime": reset_time, "etaSeconds": eta, "detail": detail,
     }
+
+
+def _recent_rate(used_pct: float, window_total: float, ctx: dict):
+    """从 _rate_ctx 取近期速率（已用百分比/秒）。
+
+    优先 15m，样本不足(近期 token 太少)依次退 30m → 60m → 返回 None。
+    recent_tokens 折算成"占该窗口已用的比例"× 当前已用百分比，除以窗口秒数。
+    返回 (rate_pct_per_sec, label) 或 (None, None)。
+    """
+    if not used_pct or not window_total or window_total <= 0:
+        return None, None
+    for label, sec, key in (("15m", 15 * 60, "recent15"),
+                            ("30m", 30 * 60, "recent30"),
+                            ("60m", 60 * 60, "recent60")):
+        rtk = ctx.get(key) or 0
+        if rtk <= 0:
+            continue
+        # 样本充分性：近期 token 至少占窗口已用 token 的 0.5%，否则视为噪声
+        if rtk / window_total < 0.005:
+            continue
+        rate = (rtk / window_total) * used_pct / sec
+        return rate, label
+    return None, None
+
+
+def _estimate_eta(used_pct: float, reset_time, window_sec, now: datetime,
+                  recent_pct_per_sec=None, recent_label=None):
+    """估算触顶情况，优先采用近期速率，样本不足时退回窗口平均速率。
+
+    recent_pct_per_sec: 近期(15/30/60min)折算的"已用百分比/秒"速率；None 表示样本不足。
+    recent_label:       近期速率来源（"15m"/"30m"/"60m"），供 tooltip 展示。
+
+    返回 dict：
+      etaSeconds: 预计触顶剩余秒数(仅当窗口内可触顶时非 None)
+      resetIn:    距本窗口重置的秒数
+      willHit:    本窗口内是否会触顶（预计触顶时间 <= 窗口剩余时间）
+      windowSec / usedPct / elapsedSec / remainingSec / ratePctPerSec:
+        供 tooltip 展示具体估算数值与公式。
+      rateSource: "recent"/"window"，本次预测采用的速率来源。
+    窗口期内到不了 100% 就明确标记 willHit=False——因为窗口会先重置，
+    显示"预计 X 后触顶"反而误导。
+    """
+    empty = {"etaSeconds": None, "resetIn": None, "willHit": False,
+             "windowSec": window_sec, "usedPct": used_pct, "elapsedSec": None,
+             "remainingSec": None, "ratePctPerSec": None,
+             "rateSource": "window", "recentLabel": None}
+    if reset_time is None or not window_sec or used_pct is None:
+        return empty
+    try:
+        dt = reset_time
+        if isinstance(dt, str):
+            dt = dt.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(dt)
+        if dt.tzinfo is None:
+            # 无时区标记的 resetTime（5h/周限额来自官网）是本地时间，按本地时区处理
+            dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    except Exception:
+        return empty
+    reset_in = (dt - now).total_seconds()
+    if reset_in <= 0:
+        return empty  # 窗口已结束/过期
+    elapsed = max(1.0, window_sec - reset_in)
+    used = max(0.0, float(used_pct))
+    win_rate = used / elapsed  # 窗口平均：已用百分比 / 已流逝秒数
+
+    # 选定预测速率：优先近期速率（样本充分时），否则退回窗口平均
+    rate = recent_pct_per_sec if recent_pct_per_sec and recent_pct_per_sec > 0 else None
+    rate_source = "recent" if rate is not None else "window"
+    if rate is None:
+        rate = win_rate
+
+    empty.update(elapsedSec=round(elapsed), remainingSec=int(reset_in),
+                 ratePctPerSec=round(rate, 6), rateSource=rate_source,
+                 recentLabel=recent_label if rate_source == "recent" else None)
+    if rate <= 0:
+        return empty
+    eta = int((100.0 - used) / rate)
+    will_hit = eta < reset_in  # 触顶必须发生在窗口重置之前才算
+    if not will_hit:
+        eta = None
+    return {"etaSeconds": eta, "resetIn": int(reset_in), "willHit": will_hit,
+            "windowSec": window_sec, "usedPct": used_pct, "elapsedSec": round(elapsed),
+            "remainingSec": int(reset_in), "ratePctPerSec": round(rate, 6),
+            "rateSource": rate_source, "recentLabel": recent_label if rate_source == "recent" else None}
 
 
 def integrated_limits(cfg: dict) -> dict:
@@ -1609,9 +1706,15 @@ def integrated_limits(cfg: dict) -> dict:
     if official.get("ok") and official.get("data"):
         d = official["data"]
         rows = []
+        now = datetime.now().astimezone()
         if d.get("amountUsedRatio") is not None:
             total = d["amountUsedRatio"] * 100
-            row = _limit_row("月额度（官网订阅）", total, d.get("expireTime"))
+            # 月额度窗口 = 当前计费周期长度（天）；起算到续费时间做窗口结束推算
+            cycle_days = cycle_bounds(datetime.now(), cfg).get("daysInCycle") or 30
+            rrate, rlabel = _recent_rate(total, _rate_ctx.get("monthTotal"), _rate_ctx)
+            est = _estimate_eta(total, d.get("expireTime"), cycle_days * 86400, now,
+                                recent_pct_per_sec=rrate, recent_label=rlabel)
+            row = _apply_est(_limit_row("月额度（官网订阅）", total, d.get("expireTime"), est["etaSeconds"]), est)
             # 月额度 = Kimi 用量 + KimiCode 用量（kimiCodeUsedRatio 是占总月额度的比例）
             if d.get("kimiCodeUsedRatio") is not None:
                 code_pct = d["kimiCodeUsedRatio"] * 100
@@ -1620,10 +1723,16 @@ def integrated_limits(cfg: dict) -> dict:
             rows.append(row)
         l5 = d.get("limits5h") or {}
         if l5.get("ratio") is not None:
-            rows.append(_limit_row("5 小时限额", l5["ratio"] * 100, l5.get("resetTime")))
+            rrate, rlabel = _recent_rate(l5["ratio"] * 100, _rate_ctx.get("h5Total"), _rate_ctx)
+            est = _estimate_eta(l5["ratio"] * 100, l5.get("resetTime"), 5 * 3600, now,
+                                recent_pct_per_sec=rrate, recent_label=rlabel)
+            rows.append(_apply_est(_limit_row("5 小时限额", l5["ratio"] * 100, l5.get("resetTime"), est["etaSeconds"]), est))
         l7 = d.get("limits7d") or {}
         if l7.get("ratio") is not None:
-            rows.append(_limit_row("周限额", l7["ratio"] * 100, l7.get("resetTime")))
+            rrate, rlabel = _recent_rate(l7["ratio"] * 100, _rate_ctx.get("d7Total"), _rate_ctx)
+            est = _estimate_eta(l7["ratio"] * 100, l7.get("resetTime"), 7 * 86400, now,
+                                recent_pct_per_sec=rrate, recent_label=rlabel)
+            rows.append(_apply_est(_limit_row("周限额", l7["ratio"] * 100, l7.get("resetTime"), est["etaSeconds"]), est))
         notice = None
         if d.get("notice"):
             notice = d["notice"].get("tip") or d["notice"].get("content")
@@ -1816,6 +1925,9 @@ def collect_stats():
     daily = [empty_usage() for _ in range(31)]
     hourly_models = [defaultdict(empty_usage) for _ in range(24)]
     daily_models = [defaultdict(empty_usage) for _ in range(31)]
+    # 近期速率统计：最近 15/30/60 分钟的用量（供触顶预测优先采用）
+    recent_win = {"15m": empty_usage(), "30m": empty_usage(), "60m": empty_usage()}
+    recent_ms = {"15m": 15 * 60 * 1000, "30m": 30 * 60 * 1000, "60m": 60 * 60 * 1000}
     # 本账期按"周期日"分桶：每个桶 = 从起算时刻起每 24h 一段（而不是按自然日 0 点切）。
     # 桶 0 = month_start → month_start+24h，桶 1 = +24h→+48h ……
     # 这样起算日当天不再被 0 点边界切成两半，每根柱子都精确等于一个周期日的用量，
@@ -1860,6 +1972,9 @@ def collect_stats():
                         cycle_daily_models.append(defaultdict(empty_usage))
                     add(cycle_daily[i])
                     add(cycle_daily_models[i][model])
+                for _rk in ("15m", "30m", "60m"):
+                    if t >= now_ms - recent_ms[_rk]:
+                        add(recent_win[_rk])
 
     def finalize(u):
         inp = u["inputOther"] + u["inputCacheRead"] + u["inputCacheCreation"]
@@ -1896,6 +2011,21 @@ def collect_stats():
         row.setdefault("prevCost", 0.0)
     cost_by_model.sort(key=lambda r: -(r["cost"] + r["prevCost"]))
     month_cost = cache_cost + miss_cost + out_cost
+
+    # ---- 近期速率上下文（供触顶预测优先采用近期速率） ----
+    try:
+        def _tok_total(u):
+            return u["inputOther"] + u["inputCacheRead"] + u["inputCacheCreation"] + u["output"]
+        _rate_ctx.update(
+            recent15=_tok_total(recent_win["15m"]),
+            recent30=_tok_total(recent_win["30m"]),
+            recent60=_tok_total(recent_win["60m"]),
+            monthTotal=_tok_total(cards["month"]),
+            h5Total=sum(_tok_total(h) for h in hourly[-5:]),
+            d7Total=sum(_tok_total(d_) for d_ in daily[-7:]),
+        )
+    except Exception:
+        pass
 
     pace = month_cost / days_elapsed * days_in_cycle if days_elapsed else 0.0
 
@@ -2179,6 +2309,8 @@ INDEX_HTML = """<!DOCTYPE html>
     mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
   }
   .blackcard .cost-grid, .blackcard .model-cost, .blackcard .caption { position: relative; z-index: 1; }
+  /* hover 时抬高整个费用网格，避免 tooltip 被后面的 model-cost stacking context 盖住 */
+  .blackcard .cost-grid:hover { z-index: 10; }
   @media (max-width: 860px) { .glyph-field { display: none; } }
   .blackcard .label { font-size: 15px; color: #e8edf5; font-weight: 650; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; z-index: 3; }
   .blackcard .help {
@@ -2190,8 +2322,8 @@ INDEX_HTML = """<!DOCTYPE html>
   .blackcard .help svg { width: 13px; height: 13px; display: block; }
   .blackcard .help:hover { color: #fff; }
   .blackcard .help .tip {
-    position: absolute; left: -9px; top: 22px; z-index: 20;
-    width: max-content; max-width: min(320px, 72vw);
+    position: absolute; left: -9px; top: 22px; z-index: 100;
+    width: min(420px, calc(100vw - 32px)); max-width: calc(100vw - 32px);
     background: #1b2233; border: 1px solid #31405e; border-radius: 10px;
     padding: 11px 14px 10px; font-size: 11.5px; font-weight: 400; line-height: 1.6; color: #8f9ab0;
     opacity: 0; visibility: hidden; transform: translateY(-4px);
@@ -2199,7 +2331,7 @@ INDEX_HTML = """<!DOCTYPE html>
     pointer-events: none;
   }
   .blackcard .help:hover .tip { opacity: 1; visibility: visible; transform: translateY(0); }
-  .blackcard .help .tp-f { display: block; margin-bottom: 8px; }
+  .blackcard .help .tp-f { display: block; margin-bottom: 8px; white-space: nowrap; }
   .blackcard .help .tp-f b { color: #dbe3ef; font-weight: 500; }
   .blackcard .help .tp-t { display: block; border-top: 1px solid #2a3450; padding: 5px 0 4px; }
   .blackcard .help .tp-r {
@@ -2212,8 +2344,67 @@ INDEX_HTML = """<!DOCTYPE html>
     color: #fff; font-variant-numeric: tabular-nums;
   }
   .blackcard .help .tp-r.tp-h i { color: #5d6a85; font-size: 10px; }
-  .blackcard .help .tp-note { display: block; border-top: 1px solid #2a3450; padding-top: 6px; font-size: 10.5px; color: #5d6a85; }
+  .blackcard .help .tp-note { display: block; border-top: 1px solid #2a3450; padding-top: 6px; font-size: 10.5px; color: #5d6a85; word-break: keep-all; }
   .blackcard .big { font-family: var(--num); font-size: 50px; font-weight: 700; letter-spacing: .01em; font-variant-numeric: tabular-nums; margin-bottom: 14px; }
+
+  /* 官方限额旁的帮助图标（浅色主题版） */
+  #quotaSec { position: relative; z-index: 2; }
+  #quotaSec:hover { z-index: 30; }
+  .q-help.help {
+    position: relative;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #a8b4cc; cursor: help;
+    transition: color .15s ease;
+  }
+  .q-help.help svg { width: 13px; height: 13px; display: block; }
+  .q-help.help:hover { color: var(--blue-deep); }
+  .q-help.help .tip {
+    position: absolute; left: -9px; top: 22px; z-index: 100;
+    width: min(420px, calc(100vw - 32px)); max-width: calc(100vw - 32px);
+    background: #fff; border: 1px solid #d3e3fb; border-radius: 10px;
+    box-shadow: 0 6px 22px rgba(30,60,120,.14);
+    padding: 11px 14px; font-size: 11.5px; font-weight: 400; line-height: 1.7; color: #5d6b82;
+    opacity: 0; visibility: hidden; transform: translateY(-4px);
+    transition: opacity .15s ease, transform .15s ease, visibility .15s;
+    pointer-events: none;
+  }
+  .q-help.help:hover .tip { opacity: 1; visibility: visible; transform: translateY(0); }
+  .q-help.help .tp-f { display: block; }
+  .q-help.help .tp-f b { color: #101828; font-weight: 600; }
+
+  /* 计算明细：点开才展开的紧凑表格 */
+  .quota-toggle {
+    align-self: center;
+    display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+    font-size: 11.5px; line-height: 1.6; font-weight: 600; color: var(--blue-deep);
+    background: rgba(58,141,255,.10); border: 1px solid #cfe3ff; border-radius: 999px;
+    padding: 1px 12px; cursor: pointer; margin-left: 2px;
+    transition: background .15s ease;
+  }
+  .quota-toggle:hover { background: rgba(58,141,255,.18); }
+  .quota-toggle .tgl-label { display: inline-flex; align-items: center; transform: translateY(0.5px); }
+  .quota-toggle .chev {
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 9px; transition: transform .18s ease;
+  }
+  .quota-toggle[aria-expanded="true"] .chev { transform: rotate(180deg); }
+  .quota-detail { margin-top: 14px; }
+  .quota-detail table {
+    width: 100%; border-collapse: collapse;
+    font-size: 12px; color: var(--dim);
+  }
+  .quota-detail th, .quota-detail td {
+    padding: 6px 10px; text-align: left;
+    border-bottom: 1px solid #edf1f8;
+    font-variant-numeric: tabular-nums;
+  }
+  .quota-detail th {
+    font-size: 11px; font-weight: 600; color: var(--faint); letter-spacing: .05em;
+  }
+  .quota-detail td:first-child { font-weight: 600; color: var(--text); }
+  .quota-detail td .num { font-family: var(--mono); color: var(--text); }
+  .quota-detail td .dim { color: var(--faint); font-size: 11px; }
+  .quota-detail .d-note { margin-top: 8px; font-size: 10.5px; color: var(--faint); }
   .blackcard .sub { font-size: 13.5px; color: #97a3b6; line-height: 2.0; }
   .blackcard .sub .row { display: flex; justify-content: space-between; gap: 12px; }
   .blackcard .sub .num { font-family: var(--mono); color: #fff; font-variant-numeric: tabular-nums; }
@@ -2261,6 +2452,8 @@ INDEX_HTML = """<!DOCTYPE html>
   section { margin-bottom: 16px; }
   .sec-head { font-size: 16px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: baseline; gap: 10px; }
   .sec-head .right { margin-left: auto; font-size: 11px; color: var(--faint); font-family: var(--mono); font-weight: 400; letter-spacing: .1em; }
+  /* 官方限额区块的标题/图标/按钮统一垂直居中，避免 baseline 造成按钮下坠 */
+  #quotaSec .sec-head { align-items: center; line-height: 1.6; }
 
   /* ---- 趋势图:范围切换 + 汇总条(DeepSeek 式,融入白卡体系) ---- */
   .trendcard { position: relative; }
@@ -2363,9 +2556,14 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <section class="quota reveal" id="quotaSec" style="animation-delay:60ms">
   <div class="sec-head">官方限额
+    <span class="q-help help" title="触顶时间怎么算"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.2"/><path d="M9.4 9a2.7 2.7 0 0 1 5.25.9c0 1.8-2.65 2.4-2.65 3.6"/><line x1="12" y1="16.8" x2="12.01" y2="16.8"/></svg><span class="tip">
+      <span class="tp-f">触顶时间按<b>近期 15 / 30 / 60 分钟</b>速率估算；样本不足时采用<b>窗口平均</b>；预测仅供参考，用量突变时可能偏差较大。</span>
+    </span></span>
+    <button class="quota-toggle" id="quotaToggle" aria-expanded="false"><span class="tgl-label">计算明细</span> <span class="chev">▾</span></button>
     <span class="right" id="quotaMeta"></span>
   </div>
   <div class="quota-rows" id="quotaRows"></div>
+  <div class="quota-detail" id="quotaDetail" hidden></div>
   <div class="caption">QUOTA · 官网百分比(两位) → KimiCode(整数) 自动回退 · 每次刷新自动更新</div>
 </section>
 
@@ -2834,7 +3032,10 @@ function renderLimits(l) {
     const pct = Math.min(100, r.pct);
     // 用量 >=80 警示橙、>=95 危险红
     const cls = r.pct >= 95 ? " danger" : r.pct >= 80 ? " warn" : "";
-    const eta = r.etaSeconds != null ? `预计 ${fmtDur(r.etaSeconds)} 后触顶` : "";
+    // 触顶预测：窗口内可触顶才显示"预计 X 后触顶"；否则说明本窗口到不了 100%（会先重置）
+    const eta = r.willHit && r.etaSeconds != null
+      ? `预计约 ${fmtDur(r.etaSeconds)} 后触顶`
+      : (r.willHit === false && r.resetIn != null ? "预计本窗口内不会触顶" : "");
     const reset = r.resetTime ? `重置 ${new Date(r.resetTime).toLocaleString("zh-CN", {hour12: false})}` : "";
     const isSplit = r.kimiCodePct != null;
     const track = isSplit
@@ -2851,6 +3052,41 @@ function renderLimits(l) {
       ${detail}
     </div>`;
   }).join("");
+  // 计算明细表：点"计算明细"才展开，紧凑四列
+  const detail = document.getElementById("quotaDetail");
+  if (detail) {
+    const durShort = s => {
+      s = Math.max(0, Math.round(s));
+      const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+      return d ? `${d}天${h}时` : `${h}时`;
+    };
+    const srcTxt = r => r.rateSource === "recent"
+      ? `近期${r.recentLabel}` : "窗口平均";
+    const rowTxt = r => {
+      if (r.usedPct == null || r.windowSec == null) return "";
+      const prog = `${durShort(r.elapsedSec)} / ${durShort(r.windowSec)}`;
+      const rate = `${fmtNum((r.ratePctPerSec || 0) * 3600)}%/时`;
+      const eta = r.willHit && r.etaSeconds != null
+        ? `约 ${durShort(r.etaSeconds)}`
+        : (r.willHit === false ? "重置前不触顶" : "--");
+      return `<tr>
+        <td>${esc(r.name)}</td>
+        <td><span class="num">${prog}</span></td>
+        <td><span class="num">${rate}</span> <span class="dim">· ${srcTxt(r)}</span></td>
+        <td><span class="num">${eta}</span></td>
+      </tr>`;
+    };
+    detail.innerHTML = `<table>
+      <thead><tr><th>限额</th><th>窗口进度</th><th>采用速率</th><th>预计触顶</th></tr></thead>
+      <tbody>${l.rows.map(rowTxt).join("")}</tbody>
+    </table><div class="d-note">触顶时间按近期 15/30/60 分钟速率估算；样本不足时采用窗口平均。预测仅供参考，用量突变时可能偏差较大。</div>`;
+    // 打开状态下保持展开（30s 自动刷新时状态不丢失）
+    const toggle = document.getElementById("quotaToggle");
+    if (toggle) {
+      const wasOpen = toggle.getAttribute("aria-expanded") === "true";
+      detail.hidden = !wasOpen;
+    }
+  }
   if (l.notice) {
     el.innerHTML += `<div class="quota-empty" style="margin-top:12px">${esc(l.notice)}</div>`;
   }
@@ -2915,6 +3151,12 @@ async function load() {
   }
 }
 document.getElementById("refresh").onclick = load;
+document.getElementById("quotaToggle").onclick = function () {
+  const d = document.getElementById("quotaDetail");
+  const open = d.hidden;
+  d.hidden = !open;
+  this.setAttribute("aria-expanded", open ? "true" : "false");
+};
 load();
 
 // 限额区每 30 秒自动刷新（页面隐藏时暂停）
