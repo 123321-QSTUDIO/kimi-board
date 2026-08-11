@@ -976,6 +976,72 @@ def _get_cookies_timeout(window, timeout=6):
     return box
 
 
+def _cookies_for_url(window, url, timeout=6):
+    """绕过 get_cookies() 的"当前 URL"限制，按指定 URL 查 CookieManager。
+
+    kimi-auth 是 HttpOnly + host-only（无 Domain），get_cookies() 内部用 self.url，
+    页面若不在 www.kimi.com 就会漏掉它。这里临时把 EdgeChromium.url 指到目标域，
+    复用 pywebview 现成的 UI 线程调度实现（EdgeChromium.get_cookies），完事再恢复。
+    返回 {"cookies": [(name, value)...], "err": str}。
+    """
+    box = {"cookies": [], "err": ""}
+
+    def _run():
+        try:
+            from webview.platforms.winforms import BrowserView
+            from System import Func, Type
+            from threading import Semaphore
+            # 按 uid 精确匹配当前窗口的 BrowserForm，取不到再退而取第一个
+            uid = getattr(window, "uid", None)
+            inst = None
+            if uid is not None and uid in BrowserView.instances:
+                inst = BrowserView.instances[uid]
+            if inst is None:
+                for w in BrowserView.instances.values():
+                    inst = w
+                    break
+            edge = getattr(inst, "browser", None) if inst is not None else None
+            if edge is None or not hasattr(edge, "get_cookies"):
+                box["err"] = "no edge browser"
+                return
+            cookies, sem = [], Semaphore(0)
+
+            def _do():
+                old = getattr(edge, "url", None)
+                try:
+                    edge.url = url
+                    edge.get_cookies(cookies, sem)  # 内部 ContinueWith 回 UI 线程后 release
+                except Exception as e:
+                    box["err"] = str(e)[:120]
+                    try:
+                        sem.release()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        edge.url = old
+                    except Exception:
+                        pass
+
+            inst.Invoke(Func[Type](_do))
+            sem.acquire()  # 等 UI 线程回调 release
+            for c in cookies:
+                try:
+                    for morsel in c.values():
+                        box["cookies"].append((morsel.key, morsel.value))
+                except Exception:
+                    continue
+        except Exception as e:
+            box["err"] = str(e)[:120]
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        box["err"] = "timeout"
+    return box
+
+
 def _fetch_via_cookie(window) -> dict:
     """从 WebView 读 kimi-auth cookie（含 HttpOnly），在内存里用它请求 API。
 
@@ -983,6 +1049,7 @@ def _fetch_via_cookie(window) -> dict:
     """
     token = None
     names = []
+    # 快路径：按当前页 URL 取（get_cookies 内部用 self.url）
     box = _get_cookies_timeout(window)
     for cookie in box["cookies"]:
         try:
@@ -997,6 +1064,21 @@ def _fetch_via_cookie(window) -> dict:
             break
     if box["err"]:
         _webview_dbg["cookieErr"] = box["err"]
+    # 慢路径：当前 URL 没取到 kimi-auth → 显式按各候选域查 CookieManager
+    # （kimi-auth 是 host-only，页面若不在 www.kimi.com 会被 get_cookies 过滤）
+    if not token:
+        for u in ("https://www.kimi.com", "https://kimi.com"):
+            sub = _cookies_for_url(window, u)
+            if sub["err"]:
+                _webview_dbg["cookieErr2"] = f"{u}: {sub['err']}"
+            for nm, val in sub["cookies"]:
+                if nm not in names:
+                    names.append(nm)
+                if nm == "kimi-auth" and val:
+                    token = val
+            if token:
+                _webview_dbg["cookieSrc"] = u
+                break
     # 只记录 cookie 名字，绝不记录值（JWT 不进日志/Agent 上下文）
     _webview_dbg["cookieNames"] = names[-20:]
     _webview_dbg["hasKimiAuth"] = bool(token)
@@ -1119,15 +1201,19 @@ def run_connect_webview(port: int) -> None:
         window.__kb_sub=null; // 已消费，下一轮重新拉取，保证后台实时刷新拿到新数据
         return __r;
       }
-      // 优先走 API（含 Kimi/KimiCode 拆分字段）；有在途请求就不重复发起
+      // 主路径：selfFetch 调 API（含 Kimi/KimiCode 拆分字段），认证头从 account token 派生
       if(!window.__kb_pending){ selfFetch(function(){}); }
-      // DOM 兜底仅在"API 确认失败 且 无在途请求"时使用，避免抢走 API 的完整数据
-      if(window.__kb_apifail && !window.__kb_pending){
-        try{
-          var d=scrapeDom();
-          if(d){ window.__kb_sub={ok:true,data:JSON.stringify(d)}; return JSON.stringify(window.__kb_sub); }
-        }catch(e){}
-      }
+      // 兜底：DOM 抓取（页面已渲染的数字）。token 过期后 API 持续 401，DOM 是可持续数据源。
+      // 只要 DOM 有数据就用（不被 pending 永久阻塞；API 成功时 capture 会用完整数据覆盖）
+      try{
+        var d=scrapeDom();
+        if(d && (d.subscriptionBalance.amountUsedRatio!=null)){
+          btnState(true);
+          // API 在途且未失败时，先等 API（拿拆分字段）；API 已失败则直接用 DOM
+          if(!window.__kb_apifail && window.__kb_pending){ /* 等 API */ }
+          else { return JSON.stringify({ok:true,data:JSON.stringify(d)}); }
+        }
+      }catch(e){}
       // 兜底按钮
       if(!document.getElementById('kb-sync-done')){
         var b=document.createElement('div');
@@ -1141,12 +1227,14 @@ def run_connect_webview(port: int) -> None:
         try{document.body.appendChild(b);}catch(e){}
       }
       window.__kb_dbg={
-        cookieAuth:(function(){try{return document.cookie.indexOf('kimi-auth=')>=0;}catch(e){return 'err';}})(),
-        jwt:(function(){var j=findJwt();return j?('yes:'+j.slice(0,24)):'no';})(),
         err:window.__kb_lasterr||'',
         href:(location.href||'').slice(0,90),
         apifail:window.__kb_apifail?1:0,
-        pending:window.__kb_pending?1:0
+        pending:window.__kb_pending?1:0,
+        // 是否找到 account token（仅布尔，不暴露 token 本身）
+        authFound:(function(){var a=accountAuth();return a?'yes':'no';})(),
+        // 总量 Code 段宽度（调试用，仅数字）
+        codeRatio:(function(){var v=(typeof codeRatioFromBar==='function')?codeRatioFromBar():null;return v!=null?v:'none';})()
       };
       return null;
       // ---- helpers ----
@@ -1178,56 +1266,166 @@ def run_connect_webview(port: int) -> None:
         }
         return jt;
       }
+      // 解析 JWT payload（base64url），提取派生头所需的字段；token 只在页面内用，不外泄
+      function parseJwt(tk){
+        try{
+          var p=tk.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+          while(p.length%%4)p+='=';
+          return JSON.parse(decodeURIComponent(escape(atob(p))));
+        }catch(e){return null;}
+      }
+      // 在 localStorage/sessionStorage 里找 account token（iss==='account'，含 device_id/ssid/sub）
+      // 接口认证用的是它（不是 cookie 里的 user-center kimi-auth）
+      function accountAuth(){
+        var cands=[];
+        try{
+          var stores=[localStorage,sessionStorage];
+          for(var s=0;s<stores.length;s++){
+            for(var i=0;i<stores[s].length;i++){
+              var v=stores[s].getItem(stores[s].key(i));
+              if(!v) continue;
+              var m=v.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+              var tk=(v.indexOf('eyJ')===0)?v:(m?m[0]:null);
+              if(tk) cands.push(tk);
+            }
+          }
+        }catch(e){}
+        // 也看 cookie 里的 token（作为候选，但 account token 优先）
+        try{
+          var cs=document.cookie.split(';');
+          for(var i=0;i<cs.length;i++){var p=cs[i].trim();
+            if(/^kimi-auth=/.test(p)){cands.push(p.slice(10));}}
+        }catch(e){}
+        for(var c=0;c<cands.length;c++){
+          var pl=parseJwt(cands[c]);
+          if(pl&&pl.iss==='account'&&pl.device_id&&pl.ssid){
+            return {
+              'Authorization':'Bearer '+cands[c],
+              'x-msh-device-id':String(pl.device_id),
+              'x-msh-session-id':String(pl.ssid),
+              'x-traffic-id':String(pl.sub||'')
+            };
+          }
+        }
+        return null;
+      }
       function selfFetch(cb){
         if(window.__kb_pending){ cb&&cb(false,'busy'); return; }
         window.__kb_pending=true;
-        var hdrs={'Content-Type':'application/json'};
-        // 复用站点自己请求时捕获到的请求头（含 Authorization、x-msh-*）
+        // 静态头 + connect 协议版本（接口要求，缺了会 401）
+        var hdrs={'Content-Type':'application/json','connect-protocol-version':'1',
+                  'x-msh-platform':'web','x-msh-version':'2.0.0','x-language':'zh-CN'};
+        // 复用站点自己请求时捕获到的请求头（最权威），覆盖默认
         try{if(window.__kb_hdrs){for(var k in window.__kb_hdrs){hdrs[k]=window.__kb_hdrs[k];}}}catch(e){}
-        // 兜底：从 cookie 或 localStorage/sessionStorage 找 JWT，补 Authorization 头（JWT 仍在 WebView 内，不外泄）
+        // 认证：从 account token 派生 Authorization + x-msh-device-id/session-id/x-traffic-id
         if(!hdrs['authorization']&&!hdrs['Authorization']){
-          var jt=findJwt();
-          if(jt) hdrs['Authorization']='Bearer '+jt;
+          var au=accountAuth();
+          if(au){for(var k2 in au){hdrs[k2]=au[k2];}}
         }
+        // 诊断：记录实际发送的头键名（不记值，防泄密）
+        window.__kb_sentHdrs=Object.keys(hdrs).sort();
+        // 超时保护：8s 未响应则中止，防止 __kb_pending 卡死
+        var ctrl=(window.AbortController?new AbortController():null);
+        var sig=ctrl?ctrl.signal:undefined;
+        var to=setTimeout(function(){try{ctrl&&ctrl.abort();}catch(e){}},8000);
         (function(){
-          fetch(U,{method:'POST',headers:hdrs,body:'{}',credentials:'include'})
-            .then(function(r){window.__kb_pending=false;window.__kb_lasterr='HTTP '+r.status;return r.ok?r.text():Promise.reject('HTTP '+r.status);})
+          fetch(U,{method:'POST',headers:hdrs,body:'{}',credentials:'include',signal:sig})
+            .then(function(r){clearTimeout(to);window.__kb_pending=false;window.__kb_lasterr='HTTP '+r.status;return r.ok?r.text():Promise.reject('HTTP '+r.status);})
             .then(function(t){try{var o=JSON.parse(t);capture(o);window.__kb_apifail=false;btnState(true);cb&&cb(true,'ok');}catch(e){window.__kb_apifail=true;window.__kb_lasterr='parse:'+e;btnState(false);cb&&cb(false,'parse');}})
-            .catch(function(e){window.__kb_sub=null;window.__kb_pending=false;window.__kb_apifail=true;window.__kb_lasterr=''+e;btnState(false);cb&&cb(false,String(e));});
+            .catch(function(e){clearTimeout(to);window.__kb_sub=null;window.__kb_pending=false;window.__kb_apifail=true;window.__kb_lasterr=''+e;btnState(false);cb&&cb(false,String(e));});
         })();
       }
       function numIn(src,re){var m=src.match(re);return m?parseFloat(m[1]):null;}
       function seg(a,b){var i=document.body.innerText.indexOf(a),j=document.body.innerText.indexOf(b);
         return (i>=0&&j>i)?document.body.innerText.slice(i,j):'';}
+      // 从元素读宽度百分比：el.style.width 形如 "64.69 百分比"，getAttribute('style') 形如 "width: 64.69 百分比;"
+      function widthPct(el){
+        if(!el) return null;
+        var w=(el.style&&el.style.width)||'';
+        var m=w.match(/([\d.]+)/);           // 提取小数部分
+        if(m) return parseFloat(m[1]);
+        var s=el.getAttribute('style')||'';
+        var m2=s.match(/width:\s*([\d.]+)%%/);
+        return m2?parseFloat(m2[1]):null;
+      }
+      // Code 段宽度：在"总使用量"所在的 usage-section 里，找 .kimi-progress 的 .blue 段
+      // （DOM 常驻，无需 hover；.primary 是 Kimi 段，.blue 是 Code 段，width 即占月额度比例）
+      function codeRatioFromBar(){
+        try{
+          var secs=document.querySelectorAll('.usage-section');
+          for(var i=0;i<secs.length;i++){
+            var s=secs[i];
+            var title=s.querySelector('.usage-section-title');
+            var tt=(title?title.textContent:'')||s.textContent||'';
+            if(tt.indexOf('\u603b\u4f7f\u7528\u91cf')===-1) continue;  // 只认"总使用量"区
+            var blue=s.querySelector('.kimi-progress .blue');
+            var v=widthPct(blue);
+            if(v!=null) return v;
+          }
+          // 兜底：任意 .kimi-progress 里同时有 .primary 和 .blue 的，取第一个 .blue
+          var bars=document.querySelectorAll('.kimi-progress');
+          for(var j=0;j<bars.length;j++){
+            if(bars[j].querySelector('.primary')&&bars[j].querySelector('.blue')){
+              var v2=widthPct(bars[j].querySelector('.blue'));
+              if(v2!=null) return v2;
+            }
+          }
+        }catch(e){}
+        return null;
+      }
       function scrapeDom(){
         var t=document.body?document.body.innerText:'';
-        var used=numIn(t,/[\u603b\u4f7f\u7528\u91cf][^\d]*([\d.]+)%%/);      // 总使用量
-        var h5s=seg('\u5c0f\u65f6\u7528\u91cf','\u5929\u7528\u91cf');        // 小时用量~天用量
-        var d7s=seg('\u5929\u7528\u91cf','\u989d\u5ea6\u52a0\u6cb9\u5305');  // 天用量~额度加油包
+        // tooltip 可能是隐藏元素，innerText 读不到 → 用 textContent 兜底（含隐藏节点）
+        var tc=document.body?document.body.textContent:'';
+        // 总使用量，形如 "总使用量 91.97 百分比"
+        var used=numIn(t,/\u603b\u4f7f\u7528\u91cf[^\d]*([\d.]+)%%/);
+        if(used==null) used=numIn(tc,/\u603b\u4f7f\u7528\u91cf[^\d]*([\d.]+)%%/);
+        // 5 小时用量 / 7 天用量：分段取 Code 后面的百分比数字
+        var h5s=seg('\u5c0f\u65f6\u7528\u91cf','\u5929\u7528\u91cf');        // 小时用量 ~ 天用量
+        var d7s=seg('\u5929\u7528\u91cf','\u989d\u5ea6\u52a0\u6cb9\u5305');  // 天用量 ~ 额度加油包
         var h5=numIn(h5s,/Code[^\d]*([\d.]+)%%/i);
         var d7=numIn(d7s,/Code[^\d]*([\d.]+)%%/i);
-        var r5=/\d{2}-\d{2}\s*\d{2}:\d{2}/.exec(h5s);
-        var r7=/\d{2}-\d{2}\s*\d{2}:\d{2}/.exec(d7s);
-        var ex=/\u7eed\u8d39\u65f6\u95f4[^\d]*(\d{4}-\d{2}-\d{2})/.exec(t);  // 续费时间
+        // Kimi Code 拆分：直接读总量进度条 .blue 段的 style.width（占月额度的比例）
+        var code=codeRatioFromBar();
+        // 重置时间：优先取 "08-11 23:22 后重置" 里的日期时间
+        var r5=/(\d{2}-\d{2})\s*(\d{2}:\d{2})/.exec(h5s);
+        var r7=/(\d{2}-\d{2})\s*(\d{2}:\d{2})/.exec(d7s);
+        // 续费/重置时间：「下次自动续费时间：2026-08-19」或「2026-08-19 后重置」
+        var ex=/(\d{4}-\d{2}-\d{2})/.exec(t);
         if(used==null&&h5==null&&d7==null) return null;
-        function iso(s){ if(!s) return null; var y=new Date().getFullYear(); return y+'-'+s.replace(' ','T')+':00'; }
+        function iso(m){ if(!m) return null; var y=new Date().getFullYear(); return y+'-'+m[1]+'T'+m[2]+':00'; }
         return {
-          subscriptionBalance:{amountUsedRatio:used!=null?used/100:null,expireTime:ex?ex[1]+'T00:00:00Z':null},
-          ratelimitCode5h:{ratio:h5!=null?h5/100:null,resetTime:iso(r5?r5[0]:null)},
-          ratelimitCode7d:{ratio:d7!=null?d7/100:null,resetTime:iso(r7?r7[0]:null)}
+          subscriptionBalance:{
+            amountUsedRatio:used!=null?used/100:null,
+            kimiCodeUsedRatio:code!=null?code/100:null,
+            expireTime:ex?ex[1]+'T00:00:00Z':null
+          },
+          ratelimitCode5h:{ratio:h5!=null?h5/100:null,resetTime:iso(r5)},
+          ratelimitCode7d:{ratio:d7!=null?d7/100:null,resetTime:iso(r7)}
         };
       }
     })()""" % (SUBSTATS_URL,)
     state = {"ok": False, "fails": 0, "lastOk": 0.0}
+    closed = {"by_user": False}  # 用户主动关窗（区别于"清除登录"的静默退出）
     window = webview.create_window(
         "Kimi Board · Kimi 登录（月额度，后台实时刷新）",
         "https://www.kimi.com/membership/subscription?tab=quota",
         width=920, height=760, min_size=(760, 600),
     )
 
+    def _on_closed():
+        # 用户点了窗口 X：立即停止后台轮询，并视为"结束会话"
+        closed["by_user"] = True
+
+    try:
+        window.events.closed += _on_closed
+    except Exception:
+        pass
+
     def _loop(window):
         got = False
-        while not _webview_stop:
+        # 轮询退出条件：全局停止（清除登录）或 用户关窗
+        while not _webview_stop and not closed["by_user"]:
             _webview_dbg["loopAt"] = int(_t.time())
             # 主路径：Python 从 WebView 读 kimi-auth cookie（含 HttpOnly），内存内直接请求 API
             norm = _fetch_via_cookie(window)
@@ -1267,9 +1465,12 @@ def run_connect_webview(port: int) -> None:
                 except Exception as e:
                     _webview_dbg["probeErr"] = str(e)[:160]
                 # 收集 WebView 内诊断信息（排查用）
+                # evaluate_js 会把 JS 对象自动转成 Python dict（不是 JSON 字符串），两种都兼容
                 try:
                     dbg = window.evaluate_js("window.__kb_dbg")
-                    if isinstance(dbg, str):
+                    if isinstance(dbg, dict):
+                        _webview_dbg.update(dbg)
+                    elif isinstance(dbg, str):
                         try:
                             _webview_dbg.update(json.loads(dbg))
                         except Exception:
@@ -1279,7 +1480,7 @@ def run_connect_webview(port: int) -> None:
             if state["ok"]:
                 _t.sleep(30 if got else 3)
                 got = False
-                if _webview_stop:
+                if _webview_stop or closed["by_user"]:
                     break
                 # 健康检查：超过 2.5 分钟没拿到新数据说明会话失效 → 弹窗重新登录
                 if _t.time() - state["lastOk"] > 150:
@@ -1295,20 +1496,24 @@ def run_connect_webview(port: int) -> None:
                         pass
             else:
                 _t.sleep(3)
-        # 退出：清理 kimi.com 登录态（WebView profile 内）
-        try:
-            window.evaluate_js(
-                "try{localStorage.clear();sessionStorage.clear();"
-                "document.cookie.split(';').forEach(function(c){var n=c.split('=')[0].trim();"
-                "if(n){document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.kimi.com';"
-                "document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';}});}catch(e){}")
-        except Exception:
-            pass
-        try:
-            webview.delete_cookie("www.kimi.com")
-            webview.delete_cookie(".kimi.com")
-        except Exception:
-            pass
+        # 退出分两种：
+        #  · 用户关窗（closed["by_user"]）：只是不看，保留登录态，下次可自动重连 → 只 destroy
+        #  · 清除登录（_webview_stop）：真正登出 → 清 kimi.com 登录态
+        # 窗口可能已被用户关闭 → evaluate_js/destroy 会抛异常，逐个吞掉即可
+        if _webview_stop and not closed["by_user"]:
+            try:
+                window.evaluate_js(
+                    "try{localStorage.clear();sessionStorage.clear();"
+                    "document.cookie.split(';').forEach(function(c){var n=c.split('=')[0].trim();"
+                    "if(n){document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.kimi.com';"
+                    "document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';}});}catch(e){}")
+            except Exception:
+                pass
+            try:
+                webview.delete_cookie("www.kimi.com")
+                webview.delete_cookie(".kimi.com")
+            except Exception:
+                pass
         try:
             window.destroy()
         except Exception:
@@ -1316,7 +1521,12 @@ def run_connect_webview(port: int) -> None:
 
     webview.start(_loop, window, private_mode=False,
                   storage_path=str(WEBVIEW_PROFILE_DIR))
+    # webview.start 返回有两种原因：_loop 里 destroy（清除登录），或用户点 X 关窗。
+    # 关窗只是"暂时不看"：停掉本窗口的轮询循环，但保留登录态与会话标记，
+    # 下次启动仍可后台自动重连；只有"清除登录"才真正登出（_mark_session(False)）。
+    closed["by_user"] = True  # 兜底：确保 _loop 若还没退出也会随旧 dict 停
     _webview_active = False
+    # 从未登录成功就关窗（state["ok"]==False）才会标记会话失效
     if not state["ok"]:
         _mark_session(False)
 
