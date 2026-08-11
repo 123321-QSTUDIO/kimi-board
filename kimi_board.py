@@ -2603,7 +2603,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
   <div class="quota-rows" id="quotaRows"></div>
   <div class="quota-detail" id="quotaDetail" hidden></div>
-  <div class="caption">QUOTA · 官网百分比(两位) → KimiCode(整数) 自动回退 · 每次刷新自动更新</div>
+  <div class="caption">QUOTA · 04 LIMITS</div>
 </section>
 
 <div class="blackcard reveal" style="animation-delay:80ms">
@@ -2625,7 +2625,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="payback" id="payback"></div>
   </div>
   <div class="model-cost" id="modelCost"></div>
-  <div class="caption">COST · 04 PAYBACK · 刊例价估算非实际账单</div>
+  <div class="caption">COST · 05 PAYBACK · 刊例价估算非实际账单</div>
 </div>
 
 <section class="trendcard reveal" style="animation-delay:120ms">
@@ -2636,7 +2636,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="trend-legend" id="trendLegend"></div>
   <svg id="trend" viewBox="0 0 1000 240" preserveAspectRatio="none" style="height:240px"></svg>
   <div id="trendTip"></div>
-  <div class="caption">CHART · 05 TREND</div>
+  <div class="caption">CHART · 06 TREND</div>
 </section>
 
 <div class="footer reveal" style="animation-delay:200ms"><span class="hex">⬡</span><span id="footMeta">数据来自本机 wire 文件 · 点刷新同步</span><a id="updateTip" class="update-tip" hidden target="_blank" rel="noopener"></a></div>
@@ -3061,7 +3061,7 @@ function renderLimits(l) {
       可在 <a href="/settings">设置</a> 「连接 Kimi」登录官网拿精确百分比，或确认 kimi web / 已登录。</div>`;
     return;
   }
-  const srcTxt = {official: "官网 · 百分比(两位)", local: "KimiCode · 本机", cloud: "KimiCode · 云端"}[l.source] || l.source;
+  const srcTxt = {official: "官网", local: "KimiCode · 本机", cloud: "KimiCode · 云端"}[l.source] || l.source;
   meta.textContent = `${srcTxt} · 同步于 ${new Date(l.fetchedAt).toLocaleTimeString("zh-CN", {hour12: false})}`;
   if (!l.rows.length) {
     el.innerHTML = `<div class="quota-empty">官方未返回限额数据（账号 / 地区可能不适用）。</div>`;
@@ -3097,14 +3097,14 @@ function renderLimits(l) {
     const durShort = s => {
       s = Math.max(0, Math.round(s));
       const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
-      return d ? `${d}天${h}时` : `${h}时`;
+      return d ? `${d} 天 ${h} 时` : `${h} 时`;
     };
     const srcTxt = r => r.rateSource === "recent"
       ? `近期${r.recentLabel}` : "窗口平均";
     const rowTxt = r => {
       if (r.usedPct == null || r.windowSec == null) return "";
       const prog = `${durShort(r.elapsedSec)} / ${durShort(r.windowSec)}`;
-      const rate = `${fmtNum((r.ratePctPerSec || 0) * 3600)}%/时`;
+      const rate = `${fmtNum((r.ratePctPerSec || 0) * 3600)}% / 时`;
       const eta = r.willHit && r.etaSeconds != null
         ? `约 ${durShort(r.etaSeconds)}`
         : (r.willHit === false ? "重置前不触顶" : "--");
@@ -3396,7 +3396,7 @@ SETTINGS_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="card">
-  <div class="sec-head"><span class="hex">⬡</span>官方限额 <span class="sec-desc">官网百分比(两位) → KimiCode(整数) 自动回退</span></div>
+  <div class="sec-head"><span class="hex">⬡</span>官方限额 <span class="sec-desc">官网登录数据更详细（月额度 + 5h + 周，两位小数），KimiCode 作为整数百分比兜底</span></div>
   <div class="row">
     <label>同步方式</label>
     <span class="radio">
@@ -3450,6 +3450,7 @@ SETTINGS_HTML = """<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const STATE = { pricing: null, quota: null };
+let CUR = null;  // 最近一次从后端读到的配置，供保存时空值回退（避免编辑中间态覆盖）
 const KB_SECRET = (document.querySelector('meta[name="kb-secret"]') || {}).content || "";
 const kh = () => ({ "X-KB-Secret": KB_SECRET, "Content-Type": "application/json" });
 
@@ -3478,6 +3479,7 @@ $("planTier").onchange = updatePlanMode;
 
 function fill(st) {
   const c = st.config;
+  CUR = JSON.parse(JSON.stringify(c));
   $("cycleDay").value = c.billing.day;
   $("cycleHour").value = c.billing.hour;
   $("cycleMinute").value = c.billing.minute;
@@ -3561,16 +3563,24 @@ function setStatus(msg, cls) { const s = $("status"); s.textContent = msg; s.cla
 
 async function save() {
   const mode = document.querySelector("input[name=planMode]:checked").value;
+  // 空/非法输入回退到最近一次后端配置（CUR），避免编辑中间态（清空输入框等）被防抖保存覆盖
+  const prev = CUR || {};
+  const prevB = prev.billing || {};
+  const numOr = (raw, def) => {
+    if (raw === "" || raw == null) return def;   // 空输入回退配置值，避免编辑中间态被保存
+    const n = Number(raw);
+    return isFinite(n) ? n : def;
+  };
   const cfg = {
     plan: {
       auto: mode === "auto",
-      tier: mode === "tier" ? $("planTier").value : "",
-      price: mode === "custom" ? Number($("planPrice").value) : null,
+      tier: mode === "tier" ? $("planTier").value : (prev.plan && prev.plan.tier) || "",
+      price: mode === "custom" ? Number($("planPrice").value) : (prev.plan && prev.plan.price) || null,
     },
     billing: {
-      day: Math.min(31, Math.max(1, Number($("cycleDay").value) || 1)),
-      hour: Math.min(23, Math.max(0, Number($("cycleHour").value) || 0)),
-      minute: Math.min(59, Math.max(0, Number($("cycleMinute").value) || 0)),
+      day: Math.min(31, Math.max(1, numOr($("cycleDay").value, prevB.day != null ? prevB.day : 1))),
+      hour: Math.min(23, Math.max(0, numOr($("cycleHour").value, prevB.hour != null ? prevB.hour : 0))),
+      minute: Math.min(59, Math.max(0, numOr($("cycleMinute").value, prevB.minute != null ? prevB.minute : 0))),
     },
     pricing: {
       source: $("priceSource").value,
@@ -3604,6 +3614,7 @@ async function save() {
     const st = await res.json();
     if (res.ok) {
       renderStatus(st);
+      CUR = JSON.parse(JSON.stringify(st.config || cfg));
       showToast("已保存 ✓", "ok");
     } else {
       showToast("保存失败：" + (st.error || "未知错误"), "err");
