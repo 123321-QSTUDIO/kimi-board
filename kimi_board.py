@@ -182,6 +182,9 @@ def save_cache(data: dict) -> None:
 CFG = default_config()  # 运行时配置（配置文件 + CLI 覆盖合并后的结果）
 SERVER_PORT = 8321       # 当前监听端口
 _connect_queue = None    # "连接 Kimi" 命令队列，由主线程消费并开 WebView
+_webview_active = False  # 后台 WebView 会话是否在运行
+_webview_stop = False    # 请求后台 WebView 停止并清理登录态
+_webview_dbg = {}        # WebView 内诊断信息（供 /api/debug 排查）
 
 # ---- 本地接口防护：每次运行生成随机 secret，用于非白名单来源的写操作 ----
 _local_secret = secrets.token_hex(16)
@@ -763,6 +766,10 @@ SUBSTATS_MANUAL_HEADERS = {
 }
 _websub = {"at": 0.0, "data": None}  # 内存态，webview/extension 推送后更新（已归一化）
 
+# WebView2 专属持久 profile：Cookie/JWT/localStorage 都留在这里，随 KIMI_CODE_HOME 走。
+# 必须 private_mode=False 才会真正落盘（pywebview 默认 private_mode=True 用临时目录，不持久）。
+WEBVIEW_PROFILE_DIR = kimi_home() / "webview-profile"
+
 
 def _http_post_json(url: str, body: bytes, headers=None, timeout=8):
     req = urllib.request.Request(url, data=body, headers=headers or {}, method="POST")
@@ -931,18 +938,77 @@ def fetch_subscription_manual(cfg: dict) -> tuple:
     return norm, None
 
 
-def handle_subscription_post(raw, source: str) -> dict:
-    """WebView / 扩展推送：归一化后仅存结果，不碰凭据。"""
-    norm = normalize_subscription(raw)
-    if norm is None:
-        return {"ok": False, "error": "不是 GetSubscriptionStats 的返回结构"}
+def _store_subscription(norm: dict, source: str) -> None:
+    """归一化结果落缓存 + 内存（token 永不过到这里）。"""
     cache = load_cache()
     cache["subscription"] = {
         "data": norm, "fetchedAt": int(time.time() * 1000), "source": source,
     }
     save_cache(cache)
     _websub.update(at=time.time(), data=cache["subscription"])
+
+
+def handle_subscription_post(raw, source: str) -> dict:
+    """WebView / 扩展推送：归一化后仅存结果，不碰凭据。"""
+    norm = normalize_subscription(raw)
+    if norm is None:
+        return {"ok": False, "error": "不是 GetSubscriptionStats 的返回结构"}
+    _store_subscription(norm, source)
     return {"ok": True}
+
+
+def _get_cookies_timeout(window, timeout=6):
+    """带超时地读 WebView cookie，防止 UI 线程调度不到导致永久阻塞。"""
+    box = {"ok": False, "cookies": [], "err": ""}
+
+    def _run():
+        try:
+            box["cookies"] = window.get_cookies() or []
+            box["ok"] = True
+        except Exception as e:
+            box["err"] = str(e)[:120]
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        box["err"] = "timeout"
+    return box
+
+
+def _fetch_via_cookie(window) -> dict:
+    """从 WebView 读 kimi-auth cookie（含 HttpOnly），在内存里用它请求 API。
+
+    JWT 仅作为本地变量用于本次请求，绝不写入配置/日志/缓存。
+    """
+    token = None
+    names = []
+    box = _get_cookies_timeout(window)
+    for cookie in box["cookies"]:
+        try:
+            for morsel in cookie.values():
+                names.append(morsel.key)
+                if morsel.key == "kimi-auth" and morsel.value:
+                    token = morsel.value
+                    break
+        except Exception:
+            continue
+        if token:
+            break
+    if box["err"]:
+        _webview_dbg["cookieErr"] = box["err"]
+    # 只记录 cookie 名字，绝不记录值（JWT 不进日志/Agent 上下文）
+    _webview_dbg["cookieNames"] = names[-20:]
+    _webview_dbg["hasKimiAuth"] = bool(token)
+    if not token:
+        return None
+    try:
+        headers = dict(SUBSTATS_MANUAL_HEADERS, Authorization="Bearer " + token)
+        payload = _http_post_json(SUBSTATS_URL, b"{}", headers)
+    except Exception as e:
+        _webview_dbg["apiErr"] = str(e)[:120]
+        return None
+    return normalize_subscription(payload)
 
 
 def _load_websub():
@@ -983,13 +1049,33 @@ def subscription_snapshot(cfg: dict, force=False) -> dict:
             "data": cached.get("data")}
 
 
+def _mark_session(active: bool) -> None:
+    """记录 WebView 持久会话标记（只存布尔，不含任何凭据）。"""
+    cache = load_cache()
+    cache.setdefault("webviewSession", {})
+    cache["webviewSession"]["active"] = bool(active)
+    cache["webviewSession"]["at"] = int(time.time() * 1000)
+    save_cache(cache)
+
+
+def session_active() -> bool:
+    return bool((load_cache().get("webviewSession") or {}).get("active"))
+
+
 def run_connect_webview(port: int) -> None:
-    """在主线程内运行：用 pywebview 开登录窗口，登录成功后把月额度存进看板。"""
+    """主线程内运行：登录窗口（WebView2 持久 profile，会话留存）。
+
+    登录成功 → 记会话标记 → 隐藏窗口，每 30s 用持久会话后台刷新 GetSubscriptionStats；
+    连续失败（会话失效）→ 弹窗让用户重新登录；退出/清除时清 kimi.com 登录态。
+    """
+    global _webview_active, _webview_stop
     import time as _t
     try:
         import webview
     except ImportError:
         return
+    _webview_active = True
+    _webview_stop = False
     probe = r"""(function(){
       var U='%s';
       function capture(o){
@@ -997,7 +1083,7 @@ def run_connect_webview(port: int) -> None:
       }
       // 1) 钩子：站点自己请求 GetSubscriptionStats 时，捕获其响应（和请求头）
       if(!window.__kb_hooked){
-        window.__kb_hooked=true; window.__kb_hdrs=null;
+        window.__kb_hooked=true; window.__kb_hdrs=null; window.__kb_apifail=false;
         try{
           var of=window.fetch;
           window.fetch=function(url,opts){
@@ -1028,45 +1114,86 @@ def run_connect_webview(port: int) -> None:
           };
         }catch(e){}
       }
-      if(window.__kb_sub) return JSON.stringify(window.__kb_sub);
-      // 2) DOM 兜底：直接从页面显示的额度文字提取（登录后页面必然展示）
-      try{
-        var d=scrapeDom();
-        if(d){ window.__kb_sub={ok:true,data:JSON.stringify(d)}; return JSON.stringify(window.__kb_sub); }
-      }catch(e){}
-      // 3) 兜底按钮
+      if(window.__kb_sub){
+        var __r=JSON.stringify(window.__kb_sub);
+        window.__kb_sub=null; // 已消费，下一轮重新拉取，保证后台实时刷新拿到新数据
+        return __r;
+      }
+      // 优先走 API（含 Kimi/KimiCode 拆分字段）；有在途请求就不重复发起
+      if(!window.__kb_pending){ selfFetch(function(){}); }
+      // DOM 兜底仅在"API 确认失败 且 无在途请求"时使用，避免抢走 API 的完整数据
+      if(window.__kb_apifail && !window.__kb_pending){
+        try{
+          var d=scrapeDom();
+          if(d){ window.__kb_sub={ok:true,data:JSON.stringify(d)}; return JSON.stringify(window.__kb_sub); }
+        }catch(e){}
+      }
+      // 兜底按钮
       if(!document.getElementById('kb-sync-done')){
         var b=document.createElement('div');
         b.id='kb-sync-done';
-        b.style.cssText='position:fixed;z-index:2147483647;left:16px;top:16px;background:#2e6fe8;color:#fff;border:0;border-radius:10px;padding:10px 16px;font:600 13px/1 "PingFang SC",system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(20,40,80,.25);user-select:none';
-        b.textContent='\u2713 \u6211\u5df2\u767b\u5f55\uff0c\u540c\u6b65\u5e76\u5173\u95ed';
+        b.style.cssText='position:fixed;z-index:2147483647;left:16px;top:16px;background:#8b96a8;color:#fff;border:0;border-radius:10px;padding:10px 16px;font:600 13px/1 "PingFang SC",system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px rgba(20,40,80,.25);user-select:none';
+        b.textContent='\u5c1a\u672a\u767b\u5f55\uff0c\u8bf7\u5148\u767b\u5f55';
         b.onclick=function(){
-          b.textContent='\u540c\u6b65\u4e2d...';
-          selfFetch(function(ok,msg){ b.textContent=ok?'\u5df2\u540c\u6b65\uff0c\u5373\u5c06\u5173\u95ed':'\u5931\u8d25\uff1a'+msg; });
+          b.textContent='\u68c0\u6d4b\u4e2d...';
+          selfFetch(function(ok,msg){ btnState(ok); });
         };
         try{document.body.appendChild(b);}catch(e){}
       }
-      // 4) 自己再试（复用站点捕获的请求头）
-      selfFetch(function(){});
+      window.__kb_dbg={
+        cookieAuth:(function(){try{return document.cookie.indexOf('kimi-auth=')>=0;}catch(e){return 'err';}})(),
+        jwt:(function(){var j=findJwt();return j?('yes:'+j.slice(0,24)):'no';})(),
+        err:window.__kb_lasterr||'',
+        href:(location.href||'').slice(0,90),
+        apifail:window.__kb_apifail?1:0,
+        pending:window.__kb_pending?1:0
+      };
       return null;
       // ---- helpers ----
+      function btnState(ok){
+        var b=document.getElementById('kb-sync-done');
+        if(!b) return;
+        b.style.background = ok ? '#2e6fe8' : '#8b96a8';
+        b.textContent = ok ? '\u2713 \u5df2\u767b\u5f55\uff0c\u540c\u6b65\u5e76\u540e\u53f0\u5237\u65b0' : '\u5c1a\u672a\u767b\u5f55\uff0c\u8bf7\u5148\u767b\u5f55';
+      }
+      function findJwt(){
+        var jt=null;
+        try{
+          var cs=document.cookie.split(';');
+          for(var i=0;i<cs.length;i++){var p=cs[i].trim();if(p.indexOf('kimi-auth=')===0){jt=p.slice(10);break;}}
+        }catch(e){}
+        if(!jt){
+          try{
+            var stores=[localStorage,sessionStorage];
+            for(var s=0;s<stores.length&&!jt;s++){
+              for(var i=0;i<stores[s].length;i++){
+                var v=stores[s].getItem(stores[s].key(i));
+                if(!v) continue;
+                if(v.indexOf('eyJ')===0){ jt=v; break; }
+                var m=v.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+                if(m){ jt=m[0]; break; }
+              }
+            }
+          }catch(e){}
+        }
+        return jt;
+      }
       function selfFetch(cb){
+        if(window.__kb_pending){ cb&&cb(false,'busy'); return; }
+        window.__kb_pending=true;
         var hdrs={'Content-Type':'application/json'};
         // 复用站点自己请求时捕获到的请求头（含 Authorization、x-msh-*）
         try{if(window.__kb_hdrs){for(var k in window.__kb_hdrs){hdrs[k]=window.__kb_hdrs[k];}}}catch(e){}
-        // 兜底：直接从 cookie 读 kimi-auth JWT，补 Authorization 头（JWT 仍在 WebView 内，不外泄）
+        // 兜底：从 cookie 或 localStorage/sessionStorage 找 JWT，补 Authorization 头（JWT 仍在 WebView 内，不外泄）
         if(!hdrs['authorization']&&!hdrs['Authorization']){
-          try{
-            var cs=document.cookie.split(';'),jt=null;
-            for(var i=0;i<cs.length;i++){var p=cs[i].trim();if(p.indexOf('kimi-auth=')===0){jt=p.slice(10);break;}}
-            if(jt) hdrs['Authorization']='Bearer '+jt;
-          }catch(e){}
+          var jt=findJwt();
+          if(jt) hdrs['Authorization']='Bearer '+jt;
         }
         (function(){
           fetch(U,{method:'POST',headers:hdrs,body:'{}',credentials:'include'})
-            .then(function(r){return r.ok?r.text():Promise.reject('HTTP '+r.status);})
-            .then(function(t){try{var o=JSON.parse(t);capture(o);cb(true,'ok');}catch(e){cb(false,'parse');}})
-            .catch(function(e){window.__kb_sub=null;cb(false,String(e));});
+            .then(function(r){window.__kb_pending=false;window.__kb_lasterr='HTTP '+r.status;return r.ok?r.text():Promise.reject('HTTP '+r.status);})
+            .then(function(t){try{var o=JSON.parse(t);capture(o);window.__kb_apifail=false;btnState(true);cb&&cb(true,'ok');}catch(e){window.__kb_apifail=true;window.__kb_lasterr='parse:'+e;btnState(false);cb&&cb(false,'parse');}})
+            .catch(function(e){window.__kb_sub=null;window.__kb_pending=false;window.__kb_apifail=true;window.__kb_lasterr=''+e;btnState(false);cb&&cb(false,String(e));});
         })();
       }
       function numIn(src,re){var m=src.match(re);return m?parseFloat(m[1]):null;}
@@ -1091,69 +1218,92 @@ def run_connect_webview(port: int) -> None:
         };
       }
     })()""" % (SUBSTATS_URL,)
-    state = {"done": False, "data": None}
-
-    def _loop(window):
-        while not state["done"]:
-            try:
-                res = window.evaluate_js(probe)
-                if isinstance(res, str):
-                    try:
-                        obj = json.loads(res)
-                    except Exception:
-                        obj = None
-                    if obj and obj.get("ok") and obj.get("data"):
-                        state.update(done=True, data=obj["data"])
-                        try:
-                            window.destroy()
-                        except Exception:
-                            pass
-                        return
-            except Exception:
-                pass
-            _t.sleep(3)
-
+    state = {"ok": False, "fails": 0, "lastOk": 0.0}
     window = webview.create_window(
-        "Kimi Board · 登录 Kimi（月额度）",
+        "Kimi Board · Kimi 登录（月额度，后台实时刷新）",
         "https://www.kimi.com/membership/subscription?tab=quota",
         width=920, height=760, min_size=(760, 600),
     )
-    webview.start(_loop, window)
-    if state.get("data"):
-        handle_subscription_post(state["data"], "webview")
 
-
-def run_logout_webview() -> None:
-    """清除 WebView 里 kimi.com 的登录态（localStorage/sessionStorage/cookies）。"""
-    import time as _t
-    try:
-        import webview
-    except ImportError:
-        return
-    clear_js = """(function(){
-      try { localStorage.clear(); sessionStorage.clear(); } catch(e){}
-      try {
-        document.cookie.split(';').forEach(function(c){
-          var n = c.split('=')[0].trim();
-          if (n) {
-            document.cookie = n + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.kimi.com';
-            document.cookie = n + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
-          }
-        });
-      } catch(e){}
-      return 'cleared';
-    })()"""
-    window = webview.create_window(
-        "Kimi Board · 清除 Kimi 登录数据",
-        "https://www.kimi.com", width=680, height=480,
-    )
-
-    def _do(window):
+    def _loop(window):
+        got = False
+        while not _webview_stop:
+            _webview_dbg["loopAt"] = int(_t.time())
+            # 主路径：Python 从 WebView 读 kimi-auth cookie（含 HttpOnly），内存内直接请求 API
+            norm = _fetch_via_cookie(window)
+            if norm is not None:
+                _store_subscription(norm, "webview")
+                state["fails"] = 0
+                state["lastOk"] = _t.time()
+                got = True
+                if not state["ok"]:
+                    state["ok"] = True
+                    _mark_session(True)
+                    try:
+                        window.hide()
+                    except Exception:
+                        pass
+            else:
+                # 兜底：页面内 DOM 抓取 / selfFetch（拿不到拆分字段但数值可用）
+                try:
+                    res = window.evaluate_js(probe)
+                    if isinstance(res, str):
+                        try:
+                            obj = json.loads(res)
+                        except Exception:
+                            obj = None
+                        if obj and obj.get("ok") and obj.get("data"):
+                            handle_subscription_post(obj["data"], "webview")
+                            state["fails"] = 0
+                            state["lastOk"] = _t.time()
+                            got = True
+                            if not state["ok"]:
+                                state["ok"] = True
+                                _mark_session(True)
+                                try:
+                                    window.hide()
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    _webview_dbg["probeErr"] = str(e)[:160]
+                # 收集 WebView 内诊断信息（排查用）
+                try:
+                    dbg = window.evaluate_js("window.__kb_dbg")
+                    if isinstance(dbg, str):
+                        try:
+                            _webview_dbg.update(json.loads(dbg))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if state["ok"]:
+                _t.sleep(30 if got else 3)
+                got = False
+                if _webview_stop:
+                    break
+                # 健康检查：超过 2.5 分钟没拿到新数据说明会话失效 → 弹窗重新登录
+                if _t.time() - state["lastOk"] > 150:
+                    state["fails"] += 1
+                else:
+                    state["fails"] = 0
+                if state["fails"] >= 3:
+                    state["ok"] = False
+                    state["fails"] = 0
+                    try:
+                        window.show()
+                    except Exception:
+                        pass
+            else:
+                _t.sleep(3)
+        # 退出：清理 kimi.com 登录态（WebView profile 内）
         try:
-            window.evaluate_js(clear_js)
+            window.evaluate_js(
+                "try{localStorage.clear();sessionStorage.clear();"
+                "document.cookie.split(';').forEach(function(c){var n=c.split('=')[0].trim();"
+                "if(n){document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.kimi.com';"
+                "document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';}});}catch(e){}")
         except Exception:
             pass
-        _t.sleep(1)
         try:
             webview.delete_cookie("www.kimi.com")
             webview.delete_cookie(".kimi.com")
@@ -1164,20 +1314,37 @@ def run_logout_webview() -> None:
         except Exception:
             pass
 
-    webview.start(_do, window)
+    webview.start(_loop, window, private_mode=False,
+                  storage_path=str(WEBVIEW_PROFILE_DIR))
+    _webview_active = False
+    if not state["ok"]:
+        _mark_session(False)
 
 
-def clear_kimi_login() -> None:
-    """清除 Kimi 登录数据：清看板缓存 + 由主线程跑 WebView 清 kimi.com 登录态。"""
+def webview_available() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("webview") is not None
+
+
+def clear_kimi_login() -> dict:
+    """清除 Kimi 登录数据：看板缓存 + WebView 持久 profile。"""
+    global _webview_stop
     _websub.update(data=None)
     cache = load_cache()
     cache.pop("subscription", None)
+    cache.pop("webviewSession", None)
     save_cache(cache)
+    if _webview_active:
+        # 后台 WebView 在跑：让它自己清 cookie/storage 并退出（占用中的目录不能直接删）
+        _webview_stop = True
+        return {"ok": True, "message": "已清除缓存，正在清理 WebView 登录态…"}
+    # 无 WebView 在跑：直接删持久 profile 目录即可，无需再开窗口
     try:
-        _connect_queue.put_nowait("logout")
-        return {"ok": True, "message": "已清除看板缓存，正在清除 WebView 登录态…"}
+        import shutil
+        shutil.rmtree(str(WEBVIEW_PROFILE_DIR), ignore_errors=True)
     except Exception:
-        return {"ok": False, "message": "清除失败"}
+        pass
+    return {"ok": True, "message": "已清除看板缓存与 WebView 登录态"}
 
 
 def webview_available() -> bool:
@@ -1189,9 +1356,11 @@ def _open_connect() -> dict:
     """入队"打开登录窗口"命令，由主线程消费。"""
     if not webview_available():
         return {"ok": False, "message": "未安装 pywebview：请执行 pip install pywebview，或用浏览器扩展 / 手动 Token 方式"}
+    if _webview_active:
+        return {"ok": True, "message": "WebView 会话已在后台实时刷新中"}
     try:
         _connect_queue.put_nowait("connect")
-        return {"ok": True, "message": "已打开登录窗口，请在弹出的 Kimi 页面登录"}
+        return {"ok": True, "message": "已打开登录窗口：登录后自动隐藏并每 30 秒后台刷新"}
     except Exception:
         return {"ok": False, "message": "登录窗口队列异常"}
 
@@ -1216,11 +1385,14 @@ def integrated_limits(cfg: dict) -> dict:
         d = official["data"]
         rows = []
         if d.get("amountUsedRatio") is not None:
-            detail = None
+            total = d["amountUsedRatio"] * 100
+            row = _limit_row("月额度（官网订阅）", total, d.get("expireTime"))
+            # 月额度 = Kimi 用量 + KimiCode 用量（kimiCodeUsedRatio 是占总月额度的比例）
             if d.get("kimiCodeUsedRatio") is not None:
-                detail = f"KimiCode 占月额 {d['kimiCodeUsedRatio'] * 100:.1f}%"
-            rows.append(_limit_row("月额度（官网订阅）", d["amountUsedRatio"] * 100,
-                                   d.get("expireTime"), detail=detail))
+                code_pct = d["kimiCodeUsedRatio"] * 100
+                row["kimiCodePct"] = round(min(code_pct, 100.0), 2)
+                row["kimiPct"] = round(max(0.0, min(total, 100.0) - code_pct), 2)
+            rows.append(row)
         l5 = d.get("limits5h") or {}
         if l5.get("ratio") is not None:
             rows.append(_limit_row("5 小时限额", l5["ratio"] * 100, l5.get("resetTime")))
@@ -1655,6 +1827,12 @@ INDEX_HTML = """<!DOCTYPE html>
   .quota-row .q-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #5ea2ff, #2e6fe8); }
   .quota-row .q-fill.warn { background: linear-gradient(90deg, #ffb454, #ff7a3d); }
   .quota-row .q-fill.danger { background: linear-gradient(90deg, #ff7a3d, #e5484d); }
+  .quota-row .q-track.split { display: flex; overflow: hidden; }
+  .quota-row .q-track.split > div { height: 100%; border-radius: 0; }
+  .quota-row .q-track.split > div:first-child { border-radius: 999px 0 0 999px; }
+  .quota-row .q-track.split > div:last-child { border-radius: 0 999px 999px 0; }
+  .quota-row .q-track.split .kimi { background: #c9d4e6; }
+  .quota-row .q-track.split .code { background: linear-gradient(90deg, #5ea2ff, #2e6fe8); }
   .quota-row .q-foot { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; color: var(--dim); }
   .quota-row .q-foot .num { font-family: var(--mono); color: var(--text); }
   .quota-empty { font-size: 12.5px; color: var(--faint); line-height: 1.9; }
@@ -2389,12 +2567,19 @@ function renderLimits(l) {
     const cls = r.pct >= 95 ? " danger" : r.pct >= 80 ? " warn" : "";
     const eta = r.etaSeconds != null ? `预计 ${fmtDur(r.etaSeconds)} 后触顶` : "";
     const reset = r.resetTime ? `重置 ${new Date(r.resetTime).toLocaleString("zh-CN", {hour12: false})}` : "";
+    const isSplit = r.kimiCodePct != null;
+    const track = isSplit
+      ? `<div class="q-track split"><div class="kimi" style="width:${Math.min(100, r.kimiPct)}%"></div><div class="code" style="width:${Math.min(100, r.kimiCodePct)}%"></div></div>`
+      : `<div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>`;
+    const detail = isSplit
+      ? `<div class="q-foot"><span class="num">其中 Kimi ${pctStr(r.kimiPct, 2)} + KimiCode ${pctStr(r.kimiCodePct, 2)}</span></div>`
+      : (r.detail ? `<div class="q-foot"><span class="num">${esc(r.detail)}</span></div>` : "");
     return `<div class="quota-row">
       <div class="q-head"><span class="q-name">${esc(r.name)}</span></div>
       <div class="q-nums"><span class="q-used">${pctStr(r.used, 2)}</span><span class="q-of">已用</span><span class="q-pct">剩余 ${pctStr(Math.max(0, 100 - r.pct), 1)}</span></div>
-      <div class="q-track"><div class="q-fill${cls}" style="width:${pct}%"></div></div>
+      ${track}
       <div class="q-foot"><span class="num">${esc(reset || "")}</span><span>${eta}</span></div>
-      ${r.detail ? `<div class="q-foot"><span class="num">${esc(r.detail)}</span></div>` : ""}
+      ${detail}
     </div>`;
   }).join("");
   if (l.notice) {
@@ -2462,6 +2647,18 @@ async function load() {
 }
 document.getElementById("refresh").onclick = load;
 load();
+
+// 限额区每 30 秒自动刷新（页面隐藏时暂停）
+async function refreshQuotaLight() {
+  if (document.hidden) return;
+  try {
+    const d = await (await fetch("/api/stats", {cache: "no-store"})).json();
+    renderLimits(d.limits);
+    const upd = document.getElementById("updated");
+    if (upd) upd.textContent = `更新于 ${new Date(d.generatedAt).toLocaleString("zh-CN", {hour12: false})} · ${fmt(d.turns)} turns`;
+  } catch (e) { /* 网络瞬时失败静默，等下一轮 */ }
+}
+setInterval(refreshQuotaLight, 30000);
 
 // 自动检查新版本：有更新时在页头显示 pill，点击直达 release 页
 (async () => {
@@ -2553,6 +2750,17 @@ SETTINGS_HTML = """<!DOCTYPE html>
   .state-line b { color: var(--text); font-weight: 600; }
   .state-line .off { color: var(--faint); }
   .ok-tag { color: #128a5b; } .bad-tag { color: #e5484d; }
+  #toast {
+    position: fixed; top: 18px; right: 22px; z-index: 999;
+    background: #101828; color: #fff; font-size: 12.5px; line-height: 1.5;
+    border-radius: 10px; padding: 9px 14px; box-shadow: 0 6px 20px rgba(16,24,40,.18);
+    opacity: 0; transform: translateY(-6px); transition: opacity .18s ease, transform .18s ease;
+    pointer-events: none; max-width: 60vw;
+  }
+  #toast.show { opacity: 1; transform: none; }
+  #toast.ok { background: #128a5b; }
+  #toast.err { background: #e5484d; }
+  #toast.saving { background: #2e6fe8; }
 </style>
 </head>
 <body>
@@ -2562,6 +2770,7 @@ SETTINGS_HTML = """<!DOCTYPE html>
   <span class="spacer"></span>
   <a class="back" href="/">← 返回看板</a>
 </div>
+<div id="toast"></div>
 
 <div class="card">
   <div class="sec-head"><span class="hex">⬡</span>会员档位 <span class="sec-desc">套餐月费（元），用于计算回本率</span></div>
@@ -2621,14 +2830,14 @@ SETTINGS_HTML = """<!DOCTYPE html>
       <label><input type="checkbox" id="k3half"> 按 k3 半价计算（官方称约为一半，口径未知）</label>
     </span>
   </div>
-  <div class="price-grid">
+  <div class="price-grid" id="overrideGrid" style="display:none">
     <div class="pg-head"><span>模型</span><span>缓存命中</span><span>输入</span><span>输出</span></div>
-    <div class="pg-row"><span class="pn">kimi-code/k3</span><input type="number" step="0.01" data-model="kimi-code/k3"></div>
-    <div class="pg-row"><span class="pn">kimi-code/k3-256k</span><input type="number" step="0.01" data-model="kimi-code/k3-256k"></div>
-    <div class="pg-row"><span class="pn">kimi-code/kimi-for-coding-highspeed</span><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding-highspeed"></div>
-    <div class="pg-row"><span class="pn">kimi-code/kimi-for-coding</span><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding"></div>
+    <div class="pg-row"><span class="pn">kimi-code/k3</span><input type="number" step="0.01" data-model="kimi-code/k3" data-k="0"><input type="number" step="0.01" data-model="kimi-code/k3" data-k="1"><input type="number" step="0.01" data-model="kimi-code/k3" data-k="2"></div>
+    <div class="pg-row"><span class="pn">kimi-code/k3-256k</span><input type="number" step="0.01" data-model="kimi-code/k3-256k" data-k="0"><input type="number" step="0.01" data-model="kimi-code/k3-256k" data-k="1"><input type="number" step="0.01" data-model="kimi-code/k3-256k" data-k="2"></div>
+    <div class="pg-row"><span class="pn">kimi-code/kimi-for-coding-highspeed</span><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding-highspeed" data-k="0"><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding-highspeed" data-k="1"><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding-highspeed" data-k="2"></div>
+    <div class="pg-row"><span class="pn">kimi-code/kimi-for-coding</span><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding" data-k="0"><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding" data-k="1"><input type="number" step="0.01" data-model="kimi-code/kimi-for-coding" data-k="2"></div>
   </div>
-  <div class="state-line">手动覆盖：留空则使用来源价格；填了任意一项即覆盖对应模型。<span id="priceSrcInfo"></span></div>
+  <div class="state-line" id="overrideHint" style="display:none">手动覆盖（仅 manual 源显示）：三项都填才生效，留空用内置兜底。<span id="priceSrcInfo"></span></div>
   <div class="actions">
     <button class="btn ghost" id="btnSyncPrice">立即同步价格</button>
   </div>
@@ -2636,41 +2845,21 @@ SETTINGS_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="card">
-  <div class="sec-head"><span class="hex">⬡</span>官方限额 <span class="sec-desc">同步 5 小时 / 周限额并自动推算剩余</span></div>
-  <div class="row">
-    <label>同步</label>
-    <span class="radio">
-      <label><input type="checkbox" id="quotaEnabled"> 启用官方限额同步</label>
-    </span>
-  </div>
-  <div class="row">
-    <label>数据来源</label>
-    <select id="quotaSource">
-      <option value="auto">自动（优先本地 kimi web，失败直连云端）</option>
-      <option value="local">仅本地 kimi web 接口</option>
-      <option value="cloud">仅云端 API（需已 kimi login）</option>
-    </select>
-  </div>
-  <div class="actions">
-    <button class="btn ghost" id="btnSyncQuota">立即同步配额</button>
-  </div>
-  <div class="state-line" id="quotaState"></div>
-</div>
-
-<div class="card">
-  <div class="sec-head"><span class="hex">⬡</span>月额度（官网） <span class="sec-desc">订阅月额度已用比例 + 重置时间</span></div>
+  <div class="sec-head"><span class="hex">⬡</span>官方限额 <span class="sec-desc">官网百分比(两位) → KimiCode(整数) 自动回退</span></div>
   <div class="row">
     <label>同步方式</label>
-    <select id="subSource">
-      <option value="auto">自动（内置 WebView 登录 / 浏览器扩展推送）</option>
-      <option value="manual">手动粘贴官网 Token（高级 / 救援）</option>
-    </select>
+    <span class="radio">
+      <label><input type="radio" name="subMode" value="webview"> WebView 登录</label>
+      <label><input type="radio" name="subMode" value="extension"> 浏览器扩展</label>
+      <label><input type="radio" name="subMode" value="manual"> 手动 Token（救援）</label>
+    </span>
   </div>
   <div class="actions">
-    <button class="btn" id="btnConnect">连接 Kimi（WebView 登录）</button>
+    <button class="btn" id="btnConnect">连接 Kimi</button>
     <button class="btn ghost" id="btnSyncSub">立即同步</button>
-    <a class="btn ghost" id="btnOpenSite" href="https://www.kimi.com/membership/subscription?tab=quota" target="_blank" rel="noopener" style="text-decoration:none">在浏览器打开官网配额页</a>
+    <a class="btn ghost" id="btnOpenSite" href="https://www.kimi.com/membership/subscription?tab=quota" target="_blank" rel="noopener" style="text-decoration:none">打开官网配额页</a>
   </div>
+  <div class="state-line" id="subState"></div>
   <div class="row" id="rowSubToken">
     <label>官网 Token（JWT）</label>
     <input type="text" id="subToken" placeholder="浏览器 kimi-auth cookie 的值（eyJ…）；仅在内存 / 系统凭据库" style="width:100%; flex:1">
@@ -2683,14 +2872,23 @@ SETTINGS_HTML = """<!DOCTYPE html>
     <span class="hint">默认不持久化，重启后需重新粘贴；凭据库只在保存时才写入</span>
   </div>
   <div class="row">
+    <label>官网不可用时的兜底数据源</label>
+    <select id="quotaSource">
+      <option value="auto">自动（优先本机 kimi web，失败直连云端）</option>
+      <option value="local">仅本机 kimi web</option>
+      <option value="cloud">仅云端 API</option>
+    </select>
+    <button class="btn ghost" id="btnSyncQuota">同步</button>
+  </div>
+  <div class="state-line" id="quotaState"></div>
+  <div class="row">
     <label>退出登录</label>
     <button class="btn ghost" id="btnLogout">清除 Kimi 登录数据（WebView Cookie / 存储 / 看板缓存）</button>
   </div>
-  <div class="state-line" id="subState"></div>
 </div>
 
 <div class="actions">
-  <button class="btn" id="btnSave">保存设置</button>
+  <button class="btn" id="btnSave">立即保存</button>
   <button class="btn ghost" id="btnReset">恢复默认</button>
   <span class="spacer"></span>
   <span class="state-line" id="configPath"></span>
@@ -2735,21 +2933,34 @@ function fill(st) {
   $("priceSource").value = c.pricing.source;
   $("usdCny").value = c.pricing.usdCny != null ? c.pricing.usdCny : "";
   $("k3half").checked = !!c.pricing.k3half;
-  $("quotaEnabled").checked = c.quota.enabled;
   $("quotaSource").value = c.quota.source;
-  $("subSource").value = c.subscription.source;
+  const sm = c.subscription.source === "manual" ? "manual"
+    : (st.subscription && st.subscription.source === "extension" ? "extension" : "webview");
+  document.querySelectorAll("input[name=subMode]").forEach(r => r.checked = r.value === sm);
   $("subToken").value = "";
   $("persistToken").checked = !!c.subscription.persistToken;
-  document.querySelectorAll(".price-grid input").forEach(inp => {
+  document.querySelectorAll("#overrideGrid input[data-model]").forEach(inp => {
     const ov = (c.pricing.overrides || {})[inp.dataset.model];
-    inp.value = ov ? ov.join(" ") : "";
+    inp.value = ov && ov[+inp.dataset.k] != null ? ov[+inp.dataset.k] : "";
   });
   fillPlan(st);
   $("rowUsdCny").style.display = $("priceSource").value === "modelsdev" ? "" : "none";
-  const manual = $("subSource").value === "manual";
+  updatePriceMode();
+  updateSubMode();
+  renderStatus(st);
+}
+
+function updateSubMode() {
+  const manual = document.querySelector("input[name=subMode]:checked").value === "manual";
   $("rowSubToken").style.display = manual ? "" : "none";
   $("rowPersistToken").style.display = manual ? "" : "none";
-  renderStatus(st);
+}
+document.querySelectorAll("input[name=subMode]").forEach(r => r.addEventListener("change", updateSubMode));
+
+function updatePriceMode() {
+  const m = $("priceSource").value === "manual";
+  $("overrideGrid").style.display = m ? "" : "none";
+  $("overrideHint").style.display = m ? "" : "none";
 }
 
 function renderStatus(st) {
@@ -2772,10 +2983,11 @@ function renderStatus(st) {
   if (s) {
     const srcTxt = {manual: "手动 Token", webview: "WebView 登录", extension: "浏览器扩展"}[s.source] || s.source;
     const tokTxt = st.manualTokenSet ? " · 已设置 Token（不落盘）" : "";
+    const bgTxt = st.webviewActive ? ' · <b class="ok-tag">后台实时刷新中</b>' : "";
     $("subState").innerHTML = !s.enabled
       ? '<span class="off">月额度同步已关闭</span>'
       : s.ok
-        ? `已同步（<b class="ok-tag">${srcTxt}</b>）${s.fetchedAt ? " · " + new Date(s.fetchedAt).toLocaleString("zh-CN", {hour12: false}) : ""}${s.message ? " · " + esc(s.message) : ""}${tokTxt}`
+        ? `已同步（<b class="ok-tag">${srcTxt}</b>）${s.fetchedAt ? " · " + new Date(s.fetchedAt).toLocaleString("zh-CN", {hour12: false}) : ""}${s.message ? " · " + esc(s.message) : ""}${tokTxt}${bgTxt}`
         : `<b class="bad-tag">暂无数据</b> · ${esc(s.message || "")}${tokTxt}`;
   }
 }
@@ -2784,6 +2996,18 @@ async function load() {
   const st = await (await fetch("/api/settings", {cache: "no-store"})).json();
   fill(st);
 }
+let saveTimer = null;
+function showToast(msg, cls) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = cls || "";
+  void t.offsetWidth;
+  t.classList.add("show");
+  clearTimeout(showToast._h);
+  showToast._h = setTimeout(() => t.classList.remove("show"), 1800);
+}
+function setStatus(msg, cls) { const s = $("status"); s.textContent = msg; s.className = cls; }
+
 async function save() {
   const mode = document.querySelector("input[name=planMode]:checked").value;
   const cfg = {
@@ -2803,41 +3027,78 @@ async function save() {
       k3half: $("k3half").checked,
       overrides: {},
     },
-    quota: { enabled: $("quotaEnabled").checked, source: $("quotaSource").value },
+    quota: { source: $("quotaSource").value },
     subscription: {
       enabled: true,
-      source: $("subSource").value,
+      source: document.querySelector("input[name=subMode]:checked").value === "manual" ? "manual" : "auto",
       persistToken: $("persistToken").checked,
       token: $("subToken").value.trim(),
     },
   };
-  document.querySelectorAll(".price-grid input").forEach(inp => {
-    const nums = inp.value.trim().split(/\\s+/).filter(Boolean).map(Number);
-    if (nums.length === 3 && nums.every(n => isFinite(n) && n >= 0)) {
-      cfg.pricing.overrides[inp.dataset.model] = nums;
+  const overrides = {};
+  document.querySelectorAll("#overrideGrid input[data-model]").forEach(inp => {
+    (overrides[inp.dataset.model] = overrides[inp.dataset.model] || [])[+inp.dataset.k] = inp.value.trim();
+  });
+  Object.keys(overrides).forEach(m => {
+    const arr = overrides[m];
+    if (!(arr.length === 3 && arr.every(v => v !== "" && isFinite(Number(v)) && Number(v) >= 0))) delete overrides[m];
+    else overrides[m] = arr.map(Number);
+  });
+  cfg.pricing.overrides = overrides;
+  try {
+    const res = await fetch("/api/settings", {
+      method: "POST", headers: kh(),
+      body: JSON.stringify(cfg),
+    });
+    const st = await res.json();
+    if (res.ok) {
+      renderStatus(st);
+      showToast("已保存 ✓", "ok");
+    } else {
+      showToast("保存失败：" + (st.error || "未知错误"), "err");
     }
-  });
-  const res = await fetch("/api/settings", {
-    method: "POST", headers: kh(),
-    body: JSON.stringify(cfg),
-  });
-  const st = await res.json();
-  if (res.ok) { setStatus("已保存。" + (st.pricing.ok ? "" : " 提示：" + st.pricing.message), "ok"); }
-  else { setStatus("保存失败：" + (st.error || "未知错误"), "err"); return; }
-  fill(st);
+  } catch (e) {
+    showToast("保存失败：" + e, "err");
+  }
 }
-function setStatus(msg, cls) { const s = $("status"); s.textContent = msg; s.className = cls; }
-$("btnSave").onclick = save;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  showToast("修改中…", "saving");
+  saveTimer = setTimeout(save, 600);
+}
+// 自动保存：任何设置项变更后防抖保存
+document.querySelectorAll("input[name=planMode]").forEach(r => r.addEventListener("change", scheduleSave));
+["planTier", "planPrice", "cycleDay", "cycleHour", "cycleMinute", "priceSource", "usdCny", "k3half",
+ "quotaSource", "persistToken", "subToken"].forEach(id => {
+  const el = $(id);
+  if (el) {
+    el.addEventListener("input", scheduleSave);
+    el.addEventListener("change", scheduleSave);
+  }
+});
+document.querySelectorAll("input[name=subMode]").forEach(r => r.addEventListener("change", scheduleSave));
+document.querySelectorAll("#overrideGrid input[data-model]").forEach(inp => inp.addEventListener("input", scheduleSave));
+$("btnSave").onclick = () => { clearTimeout(saveTimer); save(); };
 $("btnReset").onclick = async () => {
+  if (!window.confirm("确定要恢复默认设置吗？\\n会员档位、计费周期、价目来源、月额度等所有配置都将重置。")) return;
+  clearTimeout(saveTimer);
   const res = await fetch("/api/settings", {method: "POST", headers: kh(), body: "{}"});
   const st = await res.json();
-  setStatus("已恢复默认设置。", "ok"); fill(st);
+  setStatus("已恢复默认设置。", "ok");
+  fill(st);
+  showToast("已恢复默认设置 ✓", "ok");
 };
 $("btnSyncPrice").onclick = async () => {
   $("btnSyncPrice").disabled = true;
-  const st = await (await fetch("/api/settings?syncPrice=1", {cache: "no-store"})).json();
-  renderStatus(st);
-  setStatus("价格同步完成。" + (st.pricing.ok ? " 来源：" + st.pricing.message : " 失败：" + st.pricing.message), st.pricing.ok ? "ok" : "err");
+  showToast("正在同步价格…", "saving");
+  try {
+    const st = await (await fetch("/api/settings?syncPrice=1", {cache: "no-store"})).json();
+    renderStatus(st);
+    if (st.pricing.ok) { showToast("价格同步成功 ✓ 来源：" + st.pricing.message, "ok"); setStatus("价格同步完成。", "ok"); }
+    else { showToast("价格同步失败：" + st.pricing.message, "err"); setStatus("价格同步失败：" + st.pricing.message, "err"); }
+  } catch (e) {
+    showToast("价格同步失败：" + e, "err");
+  }
   $("btnSyncPrice").disabled = false;
 };
 $("btnSyncQuota").onclick = async () => {
@@ -2862,7 +3123,7 @@ $("btnSyncSub").onclick = async () => {
   $("btnSyncSub").disabled = true;
   setStatus("正在同步月额度…");
   try {
-    const body = JSON.stringify({subscription: {enabled: true, source: $("subSource").value, persistToken: $("persistToken").checked, token: $("subToken").value.trim()}});
+    const body = JSON.stringify({subscription: {enabled: true, source: document.querySelector("input[name=subMode]:checked").value === "manual" ? "manual" : "auto", persistToken: $("persistToken").checked, token: $("subToken").value.trim()}});
     const r = await (await fetch("/api/settings", {method: "POST", headers: kh(), body: body})).json();
     renderStatus(r);
     const st = await (await fetch("/api/settings?syncQuota=1", {cache: "no-store"})).json();
@@ -2886,12 +3147,19 @@ $("btnLogout").onclick = async () => {
   }
   $("btnLogout").disabled = false;
 };
-$("subSource").onchange = () => {
-  const manual = $("subSource").value === "manual";
-  $("rowSubToken").style.display = manual ? "" : "none";
-  $("rowPersistToken").style.display = manual ? "" : "none";
-};
-$("priceSource").onchange = () => { $("rowUsdCny").style.display = $("priceSource").value === "modelsdev" ? "" : "none"; };
+$("priceSource").onchange = () => { $("rowUsdCny").style.display = $("priceSource").value === "modelsdev" ? "" : "none"; updatePriceMode(); };
+
+// 状态区每 8 秒自动刷新（登录/后台刷新后无需手动刷新页面）
+async function refreshState() {
+  if (document.hidden) return;
+  try {
+    const st = await (await fetch("/api/settings", {cache: "no-store"})).json();
+    renderStatus(st);
+  } catch (e) { /* 瞬时失败忽略 */ }
+}
+setInterval(refreshState, 8000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshState(); });
+
 load();
 </script>
 </body>
@@ -2971,6 +3239,7 @@ def settings_state(sync_price=False, sync_quota=False) -> dict:
         "quota": quota_snapshot(cfg, force=sync_quota),
         "subscription": subscription_snapshot(cfg, force=sync_quota),
         "manualTokenSet": bool(get_manual_token(cfg)),
+        "webviewActive": _webview_active,
         "fxRate": usd_cny_rate(cfg)[0],
         "planPrices": PLAN_PRICES,
     }
@@ -3060,6 +3329,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json; charset=utf-8", body)
         elif path.path.startswith("/api/version"):
             body = json.dumps(check_update(), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif path.path == "/api/debug":
+            dbg = dict(_webview_dbg,
+                       webviewActive=_webview_active,
+                       webviewSession=session_active(),
+                       subscription=subscription_snapshot(CFG))
+            body = json.dumps(dbg, ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         else:
             self._send(404, "text/plain", b"not found")
@@ -3221,13 +3497,14 @@ def main():
     _connect_queue = queue.Queue()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
+    # 有持久 WebView 会话时，启动即后台自动重连（隐藏窗口实时刷新）
+    if webview_available() and session_active():
+        _connect_queue.put_nowait("connect")
+        print("  检测到持久 Kimi 会话，后台自动刷新月额度中…")
     try:
         while True:
-            cmd = _connect_queue.get()
-            if cmd == "logout":
-                run_logout_webview()
-            else:
-                run_connect_webview(args.port)
+            _connect_queue.get()
+            run_connect_webview(args.port)
     except KeyboardInterrupt:
         pass
 

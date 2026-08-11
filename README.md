@@ -145,11 +145,14 @@ python kimi_usage.py [--hours N | --month YYYY-MM | --all] [--by-workdir]
 
 `/usages` 只给周 / 5 小时限额，**月额度比例**来自官网 `https://www.kimi.com/.../GetSubscriptionStats`，
 该接口要官网网页登录态（`app_id: kimi` 的 JWT），kimi-code 本地 OAuth token 用不了。
-设置页「月额度（官网）」提供三种接入：
+主页「官方限额」卡片整合展示：官网（百分比两位小数）→ 无官网登录自动回退 KimiCode（整数百分比），
+**每 30 秒自动刷新**。设置页同一张「官方限额」卡提供三种接入：
 
-1. **内置 WebView 登录（默认）**：点「连接 Kimi」弹出登录窗口，正常登录一次即可。
+1. **内置 WebView 登录（默认）**：设置页「官方限额」→「连接 Kimi」，登录一次即可。
    需要 `pip install pywebview`（Windows exe 版已内置；网页版源码运行需手动装一次）。
-   登录态保存在 WebView 内，看板自动拉取月额度，无需复制任何 token。
+   登录态保存在 WebView 自己的**持久 profile** 里（Cookie/JWT/localStorage 都在其中），
+   登录后窗口自动隐藏，看板**每 30 秒用该持久会话后台实时刷新**；看板重启后自动重连隐藏窗口，
+   Kimi 官网自己的续期逻辑继续生效，无需复制任何 token。
 2. **浏览器扩展同步（可选）**：扩展声明 `www.kimi.com` 权限，用浏览器里已登录的
    Kimi 会话直接请求该接口，把解析后的数据推给本机看板——**凭据始终留在浏览器**。
 3. **手动 Token（救援）**：WebView / 验证码 / 平台兼容出问题时，把浏览器 `kimi-auth`
@@ -163,8 +166,9 @@ python kimi_usage.py [--hours N | --month YYYY-MM | --all] [--by-workdir]
 - **本地接口防护**：服务默认只绑 `127.0.0.1`；每次启动生成随机 secret 并注入页面，
   CORS 不再放行 `*`，只对同源 / kimi web 本机来源 / `chrome-extension://`（需携带 secret）
   回显来源头；校验 Host 与 Origin，恶意网页无法探测或调用本看板。
-- **凭据不出看板**：WebView 的 Cookie/JWT 只存在 WebView 自己的 profile，不导出到
-  `kimi-board.json` / 缓存 / 日志；后端只保存归一化后的额度结果（比例 / 重置时间 / 提示）。
+- **凭据不出看板**：WebView 的 Cookie/JWT 只存在 WebView 自己的**持久 profile**
+  （`~/.kimi-code/webview-profile/`，`private_mode=False` 确保落盘，随 `KIMI_CODE_HOME` 走），
+  不导出到 `kimi-board.json` / 缓存 / 日志；后端只保存归一化后的额度结果（比例 / 重置时间 / 提示）。
 - **手动 Token**：标记为"高级 / 救援"，**默认不持久化**（仅本次运行内存）；勾选后保存到
   Windows 凭据管理器，从不写入配置文件，也不会回显到设置页。
 - **清除登录数据**：设置页「清除 Kimi 登录数据」会一并清掉 WebView 的 kimi.com
