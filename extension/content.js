@@ -1,15 +1,12 @@
 // Kimi Board 浏览器组件：
-//  右侧面板：一整条，三个圆形进度条显示 月/5h/周 限额，圆下标注限额名 + 重置时间；
-//            下方显示 本账期用量 + 等效 API 费用。
-//  侧栏小条（原始样式）：本月已用 token 数，点击打开看板。
-// 数据来自本机看板 /api/stats（含 cc-switch 合并）；右侧面板自动跟随 WebUI 亮/暗主题。
+//  侧栏小条：状态灯 + 限额/用量轮播，点击打开完整看板。
+// 数据来自本机看板 /api/stats（含 cc-switch 合并）。
 // WebUI 是 SPA，用 MutationObserver 保证组件被移除后重新挂载。
 (() => {
   const DASH = "http://127.0.0.1:8321";
   const FONT = '"PingFang SC", "Microsoft YaHei", system-ui, sans-serif';
-  const MONO = 'ui-monospace, Consolas, "Cascadia Mono", monospace';
 
-  // ---- 主题：跟随 WebUI 亮/暗（用于右侧面板） ----
+  // ---- 主题：跟随 WebUI 亮/暗（用于小条状态灯） ----
   const vars = {
     light: {
       "--kb-bg": "#ffffff", "--kb-line": "#e3e9f4", "--kb-text": "#101828",
@@ -55,13 +52,6 @@
     if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
     return String(Math.round(n));
   }
-  function fmtPct(v) {
-    if (v == null) return "--";
-    const n = +(+v).toFixed(2);
-    return (n % 1 === 0 ? n : n.toFixed(2).replace(/\.?0+$/, "")) + "%";
-  }
-  const yuan = n => "¥" + (n >= 10000 ? (n / 10000).toFixed(2).replace(/\.?0+$/, "") + "万" : n.toFixed(n < 10 ? 2 : 0));
-
   async function fetchStats() {
     const d = await (await fetch(DASH + "/api/stats", { cache: "no-store" })).json();
     alive = true;
@@ -143,7 +133,7 @@
   const btnState = { prevLevel: "ok", prevR: null, timer: null };
   const carousel = { items: [], idx: 0, timer: null, running: false };
 
-  // 文本淡入淡出切换：淡出→换文本→淡入，完成后回调
+  // 文本淡入淡出切换：淡出->换文本->淡入，完成后回调
   const FADE = 1000;  // ms 渐入渐出时长
   // 数值/百分比/金额/时长加粗亮色（纯标签文字保持灰色）
   function em(text) {
@@ -216,7 +206,7 @@
     if (carousel.timer) clearTimeout(carousel.timer);
     carousel.running = false;
     if (!texts.length) { startCarousel(); return; }
-    // 每条消息 → 段数组；每段时长按长度，末段 6s（或被 secs 覆盖）
+    // 每条消息 -> 段数组；每段时长按长度，末段 6s（或被 secs 覆盖）
     const msgs = texts.map((t, i) => {
       const parts = seg(t);
       const endSec = (secs && secs[i] != null) ? secs[i] : 6;
@@ -256,7 +246,7 @@
     carousel.idx = 0;
     const playItem = () => {
       const item = carousel.items[carousel.idx];
-      // 该轮播项若对应某限额，且在提示区域内 → Logo 同步状态色；汇总项恢复默认蓝
+      // 该轮播项若对应某限额，且在提示区域内 -> Logo 同步状态色；汇总项恢复默认蓝
       if (item && item.used != null) setLogo(levelOf(item.used));
       else setLogo("ok");
       const parts = seg(item.text);
@@ -298,7 +288,7 @@
       zones[r.name] = levelOf(r.used);
     }
 
-    // 1) 恢复：限额从非 ok 回到 ok → 绿 + "已重置" 提示 10s
+    // 1) 恢复：限额从非 ok 回到 ok -> 绿 + "已重置" 提示 10s
     const prevZones = btnState.zones || {};
     const recovered = Object.keys(prevZones).filter(n =>
       prevZones[n] !== "ok" && (zones[n] || "ok") === "ok");
@@ -348,7 +338,6 @@
       const d = await fetchStats();
       renderBtnNotify(d);
       btn.title = `本账期起算 ${(d.cost && d.cost.cycleStart) ? new Date(d.cost.cycleStart).toLocaleString("zh-CN", {hour12: false}) : ""}\n已用 ${fmtTok(d.cards && d.cards.month && d.cards.month.total)} tokens\n含 cc-switch 合并的 KimiCode 用量`;
-      if (panel.style.display === "block") renderPanel(d);
     } catch (e) {
       // 诊断：显示具体失败原因（权限/CORS/网络），定位后恢复"看板未启动"
       label.textContent = "看板未启动: " + (e && e.message ? e.message : String(e)).slice(0, 40);
@@ -358,78 +347,12 @@
     }
   }
 
-  // ---- 右侧面板：三个圆形进度条 + 底部用量/费用 ----
-  const panel = document.createElement("div");
-  panel.id = "kimi-board-panel";
-  Object.assign(panel.style, {
-    position: "fixed", top: "14px", right: "12px", zIndex: "2147483646",
-    width: "128px", background: "var(--kb-bg)", border: "1px solid var(--kb-line)",
-    borderRadius: "14px", boxShadow: "0 10px 34px rgba(15,25,50,.14)",
-    fontFamily: FONT, color: "var(--kb-text)", padding: "12px 10px 10px",
-    display: "none",
-  });
-
-  function ringHTML(name, usedPct, extra, colorVar) {
-    const r = 26, c = 2 * Math.PI * r, dash = (Math.max(0, Math.min(100, usedPct || 0)) / 100) * c;
-    const warn = (usedPct || 0) >= 95 ? "var(--kb-red)" : (usedPct || 0) >= 80 ? "var(--kb-orange)" : colorVar;
-    return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px">
-      <div style="position:relative;width:60px;height:60px">
-        <svg width="60" height="60" viewBox="0 0 60 60">
-          <circle cx="30" cy="30" r="${r}" fill="none" stroke="var(--kb-soft)" stroke-width="5"/>
-          <circle cx="30" cy="30" r="${r}" fill="none" stroke="${warn}" stroke-width="5"
-            stroke-linecap="round" stroke-dasharray="${dash} ${c}"
-            transform="rotate(-90 30 30)"/>
-        </svg>
-        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">
-          <span style="font-family:${MONO};font-size:11px;font-weight:700;color:var(--kb-text)">${fmtPct(usedPct)}</span>
-        </div>
-      </div>
-      <span style="font-size:10px;color:var(--kb-dim);white-space:nowrap">${name}</span>
-      <span style="font-size:9px;color:var(--kb-faint);white-space:nowrap">${extra || ""}</span>
-    </div>`;
-  }
-
-  panel.innerHTML = `
-    <div id="kbRings" style="display:flex;flex-direction:column;align-items:center;gap:13px"></div>
-    <div style="margin-top:11px;border-top:1px solid var(--kb-line);padding-top:9px;display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--kb-dim)" id="kbStats"></div>
-    <div style="margin-top:8px;text-align:center;font-size:9px;color:var(--kb-faint)" id="kbFoot"></div>`;
-  const kbRings = panel.querySelector("#kbRings");
-  const kbStats = panel.querySelector("#kbStats");
-  const kbFoot = panel.querySelector("#kbFoot");
-
-  function renderPanel(d) {
-    const rows = (d.limits && d.limits.rows) || [];
-    const find = (kw) => rows.find(r => r.name.includes(kw));
-    const month = find("月额度") || find("月");
-    const h5 = find("5") || find("小时");
-    const wk = find("周");
-    const order = [["月额度", month, "var(--kb-bar1)"],
-                   ["5 小时", h5, "var(--kb-bar2)"],
-                   ["周限额", wk, "var(--kb-bar3)"]];
-    kbRings.innerHTML = order.map(([label, r, cv]) => {
-      if (!r || r.used == null) return ringHTML(label, 0, "暂无数据", cv);
-      const reset = r.resetTime ? new Date(r.resetTime).toLocaleString("zh-CN", {hour12: false}).slice(5, 16) : "";
-      return ringHTML(label, r.used, reset ? reset + " 重置" : "", cv);
-    }).join("");
-
-    const c = d.cost || {};
-    const cards = d.cards || {};
-    const mt = cards.month && cards.month.total;
-    kbStats.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:baseline">
-        <span>本账期</span><span style="font-family:${MONO};color:var(--kb-text);font-weight:700">${mt ? fmtCN(mt) : "--"} tokens</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:baseline">
-        <span>等效 API</span><span style="font-family:${MONO};color:var(--kb-text);font-weight:700">${yuan(c.monthTotal)}</span>
-      </div>`;
-    kbFoot.textContent = c.cycleLabel ? "周期 " + c.cycleLabel + " 起算" : "";
-  }
-
-  btn.onclick = async () => {
+  async function openBoard() {
     if (!alive) await refresh();
     if (alive) window.open(DASH, "_blank");
     else toast("看板服务未运行：请先双击解压目录里的「start.bat」（或已配置开机自启则稍等片刻）");
-  };
+  }
+  btn.onclick = openBoard;
 
   const toast = (msg) => {
     const t = document.createElement("div");
@@ -448,7 +371,6 @@
     const footer = document.querySelector("aside.side .col > .side-footer");
     if (!footer) return false;
     if (!document.getElementById("kimi-board-btn")) footer.before(btn);
-    if (!document.getElementById("kimi-board-panel")) document.body.appendChild(panel);
     return true;
   }
   if (!mount()) {
@@ -460,7 +382,6 @@
   }).observe(document.body, { childList: true, subtree: true });
 
   applyTheme();
-  panel.style.display = "block";  // 右侧面板默认显示（三个限额圆环）
   refresh();
   setInterval(refresh, 30000);
   new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["class", "data-theme"] });
