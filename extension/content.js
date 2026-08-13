@@ -52,6 +52,11 @@
     if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
     return String(Math.round(n));
   }
+  // 百分比：2 位小数去尾零（与看板 pctStr 一致，主数值整数时剩余也整数）
+  function fmtPct(v) {
+    const n = +(+v).toFixed(2);
+    return n % 1 === 0 ? String(n) : String(n).replace(/\.?0+$/, "");
+  }
   async function fetchStats() {
     const d = await (await fetch(DASH + "/api/stats", { cache: "no-store" })).json();
     alive = true;
@@ -159,7 +164,7 @@
     icon.style.transition = "opacity .2s ease";
     icon.style.opacity = "1";
   }
-  // 闪烁 = 图标整体淡出再淡入（opacity 0↔1），颜色始终是状态色
+  // 闪烁 = 图标整体淡出再淡入（opacity 0<->1），颜色始终是状态色
   function blinkLogo(level, times, interval, done) {
     stopBlink();
     const palette = detectDark() ? DARK : LIGHT;
@@ -187,7 +192,7 @@
     step();
   }
 
-  // 长文本拆段：超过 maxLen 字符就递归在最近分隔符处拆，确保每段 ≤ maxLen（小条不伸缩）
+  // 长文本拆段：超过 maxLen 字符就递归在最近分隔符处拆，确保每段 <= maxLen（小条不伸缩）
   const MAX_LEN = 22;
   function seg(text) {
     const t = String(text || "");
@@ -199,7 +204,7 @@
     return seg(t.slice(0, MAX_LEN)).concat(seg(t.slice(MAX_LEN)));
   }
 
-  // 提示序列：每段按自身长度定停留（≤11 字符=3s，>11=5s）；每段消息的"结束位"延长到 6s；
+  // 提示序列：每段按自身长度定停留（<=11 字符=3s，>11=5s）；每段消息的"结束位"延长到 6s；
   // 每条消息之间间隔 6s，全部结束后 6s 回轮播。secs[i] 若提供则覆盖该条消息末段时长（如恢复 10s）
   function playSeq(texts, secs) {
     if (btnState.timer) clearTimeout(btnState.timer);
@@ -271,9 +276,9 @@
     const mt = (cards.month && cards.month.total) || 0;
     const items = [];
     rows.filter(r => r.used != null).forEach(r =>
-      items.push({ text: `${shortName(r)} · 剩余 ${(100 - r.used).toFixed(1)}%`, used: r.used }));
+      items.push({ text: `${shortName(r)} · 剩余 ${fmtPct(Math.max(0, 100 - r.used))}%`, used: r.used }));
     items.push({ text: `本期 ${fmtCN(mt)} tokens`, used: null });
-    items.push({ text: `本期 ¥${c.monthTotal != null ? c.monthTotal.toFixed(1) : "--"}`, used: null });
+    items.push({ text: `本期 费用 ¥${c.monthTotal != null ? c.monthTotal.toFixed(1) : "--"}`, used: null });
     return items;
   }
   function renderBtnNotify(d) {
@@ -282,7 +287,7 @@
     if (!carousel.items.length) { label.textContent = "本月"; setLogo("ok"); return; }
 
     // 当前各限额的级别（用于判定"进入区域"）
-    const zones = {};   // name → level
+    const zones = {};   // name -> level
     for (const r of rows) {
       if (r.used == null) continue;
       zones[r.name] = levelOf(r.used);

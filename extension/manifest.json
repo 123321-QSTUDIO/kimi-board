@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Kimi Board · Token 用量看板",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Kimi Code WebUI 左下小条 Logo 作状态灯（蓝/黄/红/绿），轮播限额与用量并在告急/恢复时提醒；可选把官网月额度同步给本机看板（凭据不出浏览器）。",
   "icons": {
     "16": "icons/16.png",
