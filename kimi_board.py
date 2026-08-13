@@ -19,7 +19,7 @@ wire.jsonl 中 usageScope=="turn" 的 usage.record，含子 agent，不含 sessi
   - manual：仅手动价目 + 内置兜底
   手动 override（/settings 或配置文件中 pricing.overrides）优先级最高。
 
-官方配额：5 小时限额 / 周限额来自 kimi-code 官方接口——优先走本地
+官方配额：5 小时限额 / 周限额来自 kimi-code 官方接口--优先走本地
 kimi web 的 GET /api/v1/oauth/usage?provider=managed:kimi-code（server.token 认证），
 失败则直连 https://api.kimi.com/coding/v1/usages（~/.kimi-code/credentials 的
 OAuth token，必要时自动刷新）。窗口 used/limit/reset_at 均取官方数值。
@@ -57,7 +57,7 @@ USAGE_KEYS = ("inputOther", "inputCacheRead", "inputCacheCreation", "output")
 
 # 内置兜底价目（元 / 1M tokens）：(缓存命中, 输入未命中, 输出)。
 # 仅在没有联网、抓取失败且无手动覆盖时使用。
-# https://platform.kimi.com/docs/pricing/chat-k3  ·  /docs/pricing/chat-k27-code
+# https://platform.kimi.com/docs/pricing/chat-k3 , /docs/pricing/chat-k27-code
 PRICING_FALLBACK = {
     "kimi-code/k3": (2.0, 20.0, 100.0),                     # kimi-k3
     "kimi-code/k3-256k": (2.0, 20.0, 100.0),                # k3 的 256k 变体，按 k3 价
@@ -524,7 +524,7 @@ def _seed_price_cache() -> None:
             _PRICE_TABLE = _build_price_table(cleaned, CFG)
             meta = dict(prices.get("meta") or {})
             meta.update(source=prices.get("source", "cache"),
-                        message=(meta.get("message") or "") + "（上次快照，正在同步…）")
+                        message=(meta.get("message") or "") + "（上次快照，正在同步...）")
             _PRICE_META = meta
 
 
@@ -749,7 +749,7 @@ def fetch_quota(cfg: dict, force=False) -> dict:
         if not force and _quota_cache["data"] is not None and now - _quota_cache["at"] < _QUOTA_TTL:
             return _quota_cache["data"]
         if _quota_cache["busy"]:
-            return _quota_cache["data"] or {"ok": False, "message": "同步中…", "rows": []}
+            return _quota_cache["data"] or {"ok": False, "message": "同步中...", "rows": []}
         _quota_cache["busy"] = True
     result = None
     try:
@@ -853,7 +853,7 @@ def _fnum(v):
 
 
 def normalize_subscription(raw):
-    """KimiWebProvider → Board：只抽取需要的字段，丢弃其余一切（含可能的用户 ID）。"""
+    """KimiWebProvider -> Board：只抽取需要的字段，丢弃其余一切（含可能的用户 ID）。"""
     try:
         payload = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
@@ -1042,10 +1042,10 @@ def handle_subscription_post(raw, source: str) -> dict:
     """WebView / 扩展推送：按配置的 subscription.source 做来源过滤。
 
     只有配置指定的数据源才接受，避免 WebView 与扩展同时推时互相覆盖：
-      auto      → 接受任意来源（谁最后推谁生效，向后兼容）
-      webview   → 只接受 webview 来源
-      extension → 只接受 extension 来源
-      manual    → 忽略所有推送（只用手动 token）
+      auto      -> 接受任意来源（谁最后推谁生效，向后兼容）
+      webview   -> 只接受 webview 来源
+      extension -> 只接受 extension 来源
+      manual    -> 忽略所有推送（只用手动 token）
     """
     cfg = CFG
     want = (cfg.get("subscription") or {}).get("source", "auto")
@@ -1057,142 +1057,6 @@ def handle_subscription_post(raw, source: str) -> dict:
         return {"ok": False, "error": "不是 GetSubscriptionStats 的返回结构"}
     _store_subscription(norm, source)
     return {"ok": True}
-
-
-def _get_cookies_timeout(window, timeout=6):
-    """带超时地读 WebView cookie，防止 UI 线程调度不到导致永久阻塞。"""
-    box = {"ok": False, "cookies": [], "err": ""}
-
-    def _run():
-        try:
-            box["cookies"] = window.get_cookies() or []
-            box["ok"] = True
-        except Exception as e:
-            box["err"] = str(e)[:120]
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        box["err"] = "timeout"
-    return box
-
-
-def _cookies_for_url(window, url, timeout=6):
-    """绕过 get_cookies() 的"当前 URL"限制，按指定 URL 查 CookieManager。
-
-    kimi-auth 是 HttpOnly + host-only（无 Domain），get_cookies() 内部用 self.url，
-    页面若不在 www.kimi.com 就会漏掉它。这里临时把 EdgeChromium.url 指到目标域，
-    复用 pywebview 现成的 UI 线程调度实现（EdgeChromium.get_cookies），完事再恢复。
-    返回 {"cookies": [(name, value)...], "err": str}。
-    """
-    box = {"cookies": [], "err": ""}
-
-    def _run():
-        try:
-            from webview.platforms.winforms import BrowserView
-            from System import Func, Type
-            from threading import Semaphore
-            # 按 uid 精确匹配当前窗口的 BrowserForm，取不到再退而取第一个
-            uid = getattr(window, "uid", None)
-            inst = None
-            if uid is not None and uid in BrowserView.instances:
-                inst = BrowserView.instances[uid]
-            if inst is None:
-                for w in BrowserView.instances.values():
-                    inst = w
-                    break
-            edge = getattr(inst, "browser", None) if inst is not None else None
-            if edge is None or not hasattr(edge, "get_cookies"):
-                box["err"] = "no edge browser"
-                return
-            cookies, sem = [], Semaphore(0)
-
-            def _do():
-                old = getattr(edge, "url", None)
-                try:
-                    edge.url = url
-                    edge.get_cookies(cookies, sem)  # 内部 ContinueWith 回 UI 线程后 release
-                except Exception as e:
-                    box["err"] = str(e)[:120]
-                    try:
-                        sem.release()
-                    except Exception:
-                        pass
-                finally:
-                    try:
-                        edge.url = old
-                    except Exception:
-                        pass
-
-            inst.Invoke(Func[Type](_do))
-            sem.acquire()  # 等 UI 线程回调 release
-            for c in cookies:
-                try:
-                    for morsel in c.values():
-                        box["cookies"].append((morsel.key, morsel.value))
-                except Exception:
-                    continue
-        except Exception as e:
-            box["err"] = str(e)[:120]
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        box["err"] = "timeout"
-    return box
-
-
-def _fetch_via_cookie(window) -> dict:
-    """从 WebView 读 kimi-auth cookie（含 HttpOnly），在内存里用它请求 API。
-
-    JWT 仅作为本地变量用于本次请求，绝不写入配置/日志/缓存。
-    """
-    token = None
-    names = []
-    # 快路径：按当前页 URL 取（get_cookies 内部用 self.url）
-    box = _get_cookies_timeout(window)
-    for cookie in box["cookies"]:
-        try:
-            for morsel in cookie.values():
-                names.append(morsel.key)
-                if morsel.key == "kimi-auth" and morsel.value:
-                    token = morsel.value
-                    break
-        except Exception:
-            continue
-        if token:
-            break
-    if box["err"]:
-        _webview_dbg["cookieErr"] = box["err"]
-    # 慢路径：当前 URL 没取到 kimi-auth -> 显式按各候选域查 CookieManager
-    # （kimi-auth 是 host-only，页面若不在 www.kimi.com 会被 get_cookies 过滤）
-    if not token:
-        for u in ("https://www.kimi.com", "https://kimi.com"):
-            sub = _cookies_for_url(window, u)
-            if sub["err"]:
-                _webview_dbg["cookieErr2"] = f"{u}: {sub['err']}"
-            for nm, val in sub["cookies"]:
-                if nm not in names:
-                    names.append(nm)
-                if nm == "kimi-auth" and val:
-                    token = val
-            if token:
-                _webview_dbg["cookieSrc"] = u
-                break
-    # 只记录 cookie 名字，绝不记录值（JWT 不进日志/Agent 上下文）
-    _webview_dbg["cookieNames"] = names[-20:]
-    _webview_dbg["hasKimiAuth"] = bool(token)
-    if not token:
-        return None
-    try:
-        headers = dict(SUBSTATS_MANUAL_HEADERS, Authorization="Bearer " + token)
-        payload = _http_post_json(SUBSTATS_URL, b"{}", headers)
-    except Exception as e:
-        _webview_dbg["apiErr"] = str(e)[:120]
-        return None
-    return normalize_subscription(payload)
 
 
 def _load_websub():
@@ -1284,8 +1148,8 @@ def session_active() -> bool:
 def run_connect_webview(port: int) -> None:
     """主线程内运行：登录窗口（WebView2 持久 profile，会话留存）。
 
-    登录成功 → 记会话标记 → 隐藏窗口，每 30s 用持久会话后台刷新 GetSubscriptionStats；
-    连续失败（会话失效）→ 弹窗让用户重新登录；退出/清除时清 kimi.com 登录态。
+    登录成功 -> 记会话标记 -> 隐藏窗口，每 30s 用持久会话后台刷新 GetSubscriptionStats；
+    连续失败（会话失效）-> 弹窗让用户重新登录；退出/清除时清 kimi.com 登录态。
     """
     global _webview_active, _webview_stop, _webview_last_rebuild
     import time as _t
@@ -1566,7 +1430,7 @@ def run_connect_webview(port: int) -> None:
     state = {"ok": False, "fails": 0, "lastOk": 0.0}
     closed = {"by_user": False}  # 用户主动关窗（区别于"清除登录"的静默退出）
     PAGE_URL = "https://www.kimi.com/membership/subscription?tab=quota"
-    reload_flag = {"on": False}  # 数据过期 → 整窗重建（隐藏窗口 load_url 会弄坏 WebView2 控件）
+    reload_flag = {"on": False}  # 数据过期 -> 整窗重建（隐藏窗口 load_url 会弄坏 WebView2 控件）
     window = webview.create_window(
         "Kimi Board · Kimi 登录（月额度，后台实时刷新）",
         PAGE_URL,
@@ -1605,6 +1469,7 @@ def run_connect_webview(port: int) -> None:
         def _reload_page(reason, bypass=False):
             """官网数据只有整页刷新才会更新。在页面内 location.reload()（不整窗重建，
             避免闪窗；重建仅作控件损坏时的后备手段）。"""
+            global _webview_last_rebuild
             if not bypass and _t.time() - _webview_last_rebuild < 120:
                 return  # 冷却：自动重载后 2 分钟内不再触发
             # 自动重载（过期/保活）后给 10 分钟观察期；手动强制重载不计观察期
@@ -1624,7 +1489,7 @@ def run_connect_webview(port: int) -> None:
                     pass
 
         def _rebuild_if_broken(err):
-            """evaluate_js 抛"Main window failed to start"= WebView2 控件损坏 → 整窗重建。"""
+            """evaluate_js 抛"Main window failed to start"= WebView2 控件损坏 -> 整窗重建。"""
             if "failed to start" in str(err):
                 reload_flag["on"] = True
                 try:
@@ -1646,74 +1511,55 @@ def run_connect_webview(port: int) -> None:
                         if _webview_stop or closed["by_user"] or reload_flag["on"]:
                             break
                         _t.sleep(0.5)
-                # 主路径：Python 从 WebView 读 kimi-auth cookie（含 HttpOnly），内存内直接请求 API
+                # 页面内探针：selfFetch（页面上下文直连 API，含拆分字段）+ DOM 抓取兜底
                 try:
-                    norm = _fetch_via_cookie(window)
-                except Exception as _e:
-                    _webview_dbg["fetchErr"] = str(_e)[:160]
-                    norm = None
-                if norm is not None:
-                    # cookie 主路径同样遵守来源配置：扩展/手动为数据源时丢弃 WebView 抓取
-                    if (CFG.get("subscription") or {}).get("source", "auto") in ("auto", "webview"):
-                        if _is_stale(norm):
-                            # 数据已过期：不落缓存（避免给旧数据盖新时间戳），直接整页刷新
-                            _reload_page("stale")
-                        else:
-                            _store_subscription(norm, "webview")
-                            state["fails"] = 0
-                            state["lastOk"] = _t.time()
-                            got = True
-                            # 保活：页面挂机超过 30 分钟就整页刷新一次（token/数据都会刷新）
-                            if _t.time() - _webview_last_rebuild > 1800:
-                                _reload_page("keepalive")
-                            if not state["ok"]:
-                                state["ok"] = True
-                                _mark_session(True)
+                    res = window.evaluate_js(probe)
+                    if isinstance(res, str):
+                        try:
+                            obj = json.loads(res)
+                        except Exception:
+                            obj = None
+                        if obj and obj.get("ok") and obj.get("data"):
+                            if _is_stale(obj["data"]):
+                                # 数据已过期：不落缓存（避免给旧数据盖新时间戳），直接整页刷新
                                 try:
-                                    window.hide()
-                                except Exception:
-                                    pass
-                else:
-                    # 兜底：页面内 DOM 抓取 / selfFetch（拿不到拆分字段但数值可用）
-                    try:
-                        res = window.evaluate_js(probe)
-                        if isinstance(res, str):
-                            try:
-                                obj = json.loads(res)
-                            except Exception:
-                                obj = None
-                            if obj and obj.get("ok") and obj.get("data"):
-                                if _is_stale(obj["data"]):
                                     _reload_page("stale")
-                                else:
-                                    handle_subscription_post(obj["data"], "webview")
-                                    state["fails"] = 0
-                                    state["lastOk"] = _t.time()
-                                    got = True
+                                except Exception as _e:
+                                    _webview_dbg["reloadErr"] = str(_e)[:120]
+                            else:
+                                handle_subscription_post(obj["data"], "webview")
+                                state["fails"] = 0
+                                state["lastOk"] = _t.time()
+                                got = True
+                                if not state["ok"]:
+                                    state["ok"] = True
+                                    _mark_session(True)
+                                    try:
+                                        window.hide()
+                                    except Exception:
+                                        pass
+                                # 保活：页面挂机超过 30 分钟就整页刷新一次（token/数据都会刷新）
+                                # 放在状态更新之后：reload 出任何错都不能影响 会话标记/隐藏窗口
+                                try:
                                     if _t.time() - _webview_last_rebuild > 1800:
                                         _reload_page("keepalive")
-                                    if not state["ok"]:
-                                        state["ok"] = True
-                                        _mark_session(True)
-                                        try:
-                                            window.hide()
-                                        except Exception:
-                                            pass
-                    except Exception as e:
-                        _webview_dbg["probeErr"] = str(e)[:160]
-                        _rebuild_if_broken(e)
-                    # 收集 WebView 内诊断信息（排查用）
-                    try:
-                        dbg = window.evaluate_js("window.__kb_dbg")
-                        if isinstance(dbg, dict):
-                            _webview_dbg.update(dbg)
-                        elif isinstance(dbg, str):
-                            try:
-                                _webview_dbg.update(json.loads(dbg))
-                            except Exception:
-                                pass
-                    except Exception as e2:
-                        _rebuild_if_broken(e2)
+                                except Exception as _e:
+                                    _webview_dbg["reloadErr"] = str(_e)[:120]
+                except Exception as e:
+                    _webview_dbg["probeErr"] = str(e)[:160]
+                    _rebuild_if_broken(e)
+                # 收集 WebView 内诊断信息（排查用）
+                try:
+                    dbg = window.evaluate_js("window.__kb_dbg")
+                    if isinstance(dbg, dict):
+                        _webview_dbg.update(dbg)
+                    elif isinstance(dbg, str):
+                        try:
+                            _webview_dbg.update(json.loads(dbg))
+                        except Exception:
+                            pass
+                except Exception as e2:
+                    _rebuild_if_broken(e2)
                 if state["ok"]:
                     # 1s 分片睡眠，期间可被"设置页同步"的强制刷新/停止/整窗重建随时打断
                     # （整段 29s 睡眠会吃掉 force 标志，导致"立即同步"拿不到新数据）
@@ -1746,8 +1592,8 @@ def run_connect_webview(port: int) -> None:
                 _webview_dbg["loopErr"] = str(_e)[:160]
                 _t.sleep(3)
         # 退出分两种：
-        #  · 用户关窗（closed["by_user"]）：只是不看，保留登录态，下次可自动重连 -> 只 destroy
-        #  · 清除登录（_webview_stop）：真正登出 -> 清 kimi.com 登录态
+        #  - 用户关窗（closed["by_user"]）：只是不看，保留登录态，下次可自动重连 -> 只 destroy
+        #  - 清除登录（_webview_stop）：真正登出 -> 清 kimi.com 登录态
         # 窗口可能已被用户关闭 -> evaluate_js/destroy 会抛异常，逐个吞掉即可
         if _webview_stop and not closed["by_user"]:
             try:
@@ -1806,7 +1652,7 @@ def clear_kimi_login() -> dict:
     if _webview_active:
         # 后台 WebView 在跑：让它自己清 cookie/storage 并退出（占用中的目录不能直接删）
         _webview_stop = True
-        return {"ok": True, "message": "已清除缓存，正在清理 WebView 登录态…"}
+        return {"ok": True, "message": "已清除缓存，正在清理 WebView 登录态..."}
     # 无 WebView 在跑：直接删持久 profile 目录即可，无需再开窗口
     try:
         import shutil
@@ -1862,8 +1708,8 @@ def _limit_row(name, used_pct, reset_time=None, eta=None, detail=None):
 def _recent_rate(used_pct: float, window_total: float, ctx: dict):
     """从 _rate_ctx 取近期速率（已用百分比/秒）。
 
-    优先 15m，样本不足(近期 token 太少)依次退 30m → 60m → 返回 None。
-    recent_tokens 折算成"占该窗口已用的比例"× 当前已用百分比，除以窗口秒数。
+    优先 15m，样本不足(近期 token 太少)依次退 30m -> 60m -> 返回 None。
+    recent_tokens 折算成"占该窗口已用的比例" x 当前已用百分比，除以窗口秒数。
     返回 (rate_pct_per_sec, label) 或 (None, None)。
     """
     if not used_pct or not window_total or window_total <= 0:
@@ -1896,7 +1742,7 @@ def _estimate_eta(used_pct: float, reset_time, window_sec, now: datetime,
       windowSec / usedPct / elapsedSec / remainingSec / ratePctPerSec:
         供 tooltip 展示具体估算数值与公式。
       rateSource: "recent"/"window"，本次预测采用的速率来源。
-    窗口期内到不了 100% 就明确标记 willHit=False——因为窗口会先重置，
+    窗口期内到不了 100% 就明确标记 willHit=False--因为窗口会先重置，
     显示"预计 X 后触顶"反而误导。
     """
     empty = {"etaSeconds": None, "resetIn": None, "willHit": False,
@@ -1946,7 +1792,7 @@ def _estimate_eta(used_pct: float, reset_time, window_sec, now: datetime,
 def integrated_limits(cfg: dict, force=False, official=None, quota=None) -> dict:
     """整合限额展示，数据源回退链：
     1) 官网 GetSubscriptionStats（登录后，百分比精确到两位小数：月额度 / 5h / 周 + 官方提示）
-    2) 无官网登录 → KimiCode 同步（本地 kimi web → 云端 API，整数百分比：周 / 5h）
+    2) 无官网登录 -> KimiCode 同步（本地 kimi web -> 云端 API，整数百分比：周 / 5h）
 
     official / quota：调用方已取好的快照，传入可避免重复请求官网。
     """
@@ -3013,8 +2859,8 @@ const fmtK = n => n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\\.0$/, "") + "M"
              : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\\.0$/, "") + "K" : String(n);
 // 中文缩略单位（仅亿/万；<1万 返回空，不用显示）：
 // 627686630 -> "≈6.28亿"，62768 -> "≈6.3万"，9999 -> ""
-const fmtCN = n => n >= 1e8 ? "≈" + (n / 1e8).toFixed(2).replace(/\.?0+$/, "") + "亿"
-             : n >= 1e4 ? "≈" + (n / 1e4).toFixed(1).replace(/\.0$/, "") + "万"
+const fmtCN = n => n >= 1e8 ? "≈" + (n / 1e8).toFixed(2).replace(/\\.?0+$/, "") + "亿"
+             : n >= 1e4 ? "≈" + (n / 1e4).toFixed(1).replace(/\\.0$/, "") + "万"
              : "";
 const yuan = n => "¥ " + n.toLocaleString("zh-CN", {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -3234,7 +3080,7 @@ const MODEL_LABEL = {
   "kimi-code/kimi-for-coding-highspeed": "k2.7-highspeed",
   "kimi-code/kimi-for-coding": "k2.7",
 };
-const shortName = m => m === "其他" ? m : (MODEL_LABEL[m] || m.replace(/^kimi-code\//, ""));
+const shortName = m => m === "其他" ? m : (MODEL_LABEL[m] || m.replace(/^kimi-code\\//, ""));
 
 function trendLabel(p, kind, long) {
   const dt = new Date(p.t);
@@ -3482,7 +3328,7 @@ function renderPricing(p) {
 function pctStr(v, dp) {
   if (v == null) return "--";
   const n = dp ? +(+v).toFixed(dp) : Math.round(v * 10) / 10;
-  return (n % 1 === 0 ? n : n.toFixed(2).replace(/\.?0+$/, "")) + "%";
+  return (n % 1 === 0 ? n : n.toFixed(2).replace(/\\.?0+$/, "")) + "%";
 }
 function renderLimits(l) {
   const meta = document.getElementById("quotaMeta");
@@ -3517,7 +3363,7 @@ function renderLimits(l) {
       : (r.detail ? `<div class="q-foot"><span class="num">${esc(r.detail)}</span></div>` : "");
     return `<div class="quota-row">
       <div class="q-head"><span class="q-name">${esc(r.name)}</span></div>
-      <div class="q-nums"><span class="q-used">${pctStr(r.used, 2)}</span><span class="q-of">已用</span><span class="q-pct${cls}">剩余 ${pctStr(Math.max(0, 100 - r.pct), 1)}</span></div>
+      <div class="q-nums"><span class="q-used">${pctStr(r.used, 2)}</span><span class="q-of">已用</span><span class="q-pct${cls}">剩余 ${pctStr(Math.max(0, 100 - r.used), 2)}</span></div>
       ${track}
       <div class="q-foot"><span class="num">${esc(reset || "")}</span><span>${eta}</span></div>
       ${detail}
@@ -3566,7 +3412,13 @@ function renderLimits(l) {
 async function load(force) {
   const updated = document.getElementById("updated");
   try {
-    const d = await (await fetch("/api/stats" + (force ? "?refresh=1" : ""), {cache: "no-store"})).json();
+    // fetch 必须带超时：挂起的请求会把 loadBusy 永久卡死，30s 轮询全部失效
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 10000);
+    let d;
+    try {
+      d = await (await fetch("/api/stats" + (force ? "?refresh=1" : ""), {cache: "no-store", signal: ctrl.signal})).json();
+    } finally { clearTimeout(to); }
     const c = d.cost;
     document.getElementById("heroMeta").innerHTML =
       `<span class="hex">⬡</span>${esc((c.planName || "FREE PLAN").toUpperCase())} · ${fmt(d.turns)} TURNS TRACKED · 账期 ${esc(c.cycleLabel)}`;
@@ -3649,6 +3501,8 @@ async function refreshAll() {
   await loadOnce();
 }
 setInterval(refreshAll, 30000);
+// 标签页从隐藏/冻结恢复时立即刷新，不等下一个 30s  tick
+document.addEventListener("visibilitychange", () => { if (!document.hidden) loadOnce(); });
 
 // 自动检查新版本：有更新时在页头显示 pill，点击直达 release 页
 (async () => {
@@ -3819,7 +3673,7 @@ SETTINGS_HTML = """<!DOCTYPE html>
     </select>
   </div>
   <div class="row" id="rowUsdCny">
-    <label>USD → CNY 汇率</label>
+    <label>USD -> CNY 汇率</label>
     <input type="number" id="usdCny" min="0" step="0.001" class="wide">
     <span class="hint">留空 = 自动获取；自动获取失败时按 7.25 估算</span>
   </div>
@@ -3861,7 +3715,7 @@ SETTINGS_HTML = """<!DOCTYPE html>
   <div class="state-line" id="subState"></div>
   <div class="row" id="rowSubToken">
     <label>官网 Token（JWT）</label>
-    <input type="text" id="subToken" placeholder="浏览器 kimi-auth cookie 的值（eyJ…）；仅在内存 / 系统凭据库" style="width:100%; flex:1">
+    <input type="text" id="subToken" placeholder="浏览器 kimi-auth cookie 的值（eyJ...）；仅在内存 / 系统凭据库" style="width:100%; flex:1">
   </div>
   <div class="row" id="rowPersistToken">
     <label>保存方式</label>
@@ -3925,7 +3779,7 @@ function fillPlan(st) {
   $("planPrice").value = p.price != null ? p.price : "";
   const tierSel = $("planTier");
   tierSel.innerHTML = Object.entries(st.planPrices || {})
-    .map(([k, v]) => `<option value="${esc(k)}">${esc(k)} — ¥${v}</option>`).join("");
+    .map(([k, v]) => `<option value="${esc(k)}">${esc(k)} - ¥${v}</option>`).join("");
   tierSel.value = p.tier || "";
   updatePlanMode();
 }
@@ -3935,7 +3789,7 @@ function updatePlanMode() {
   $("rowTier").style.display = mode === "tier" ? "" : "none";
   $("rowCustom").style.display = mode === "custom" ? "" : "none";
   $("tierPrice").textContent = $("planTier").selectedIndex >= 0 && $("planTier").options.length
-    ? `→ ¥${$("planTier").options[$("planTier").selectedIndex].text.split("—")[1] || ""}`
+    ? `-> ¥${$("planTier").options[$("planTier").selectedIndex].text.split("¥")[1] || ""}`
     : "";
 }
 document.querySelectorAll("input[name=planMode]").forEach(r => r.onchange = updatePlanMode);
@@ -3952,7 +3806,7 @@ function fill(st) {
   $("k3half").checked = !!c.pricing.k3half;
   $("quotaSource").value = c.quota.source;
   const sm = (c.subscription.source === "manual" || c.subscription.source === "extension"
-    || c.subscription.source === "webview") ? c.subscription.source : "webview";  // auto → 默认 webview
+    || c.subscription.source === "webview") ? c.subscription.source : "webview";  // auto -> 默认 webview
   document.querySelectorAll("input[name=subMode]").forEach(r => r.checked = r.value === sm);
   $("subToken").value = "";
   $("persistToken").checked = !!c.subscription.persistToken;
@@ -4114,7 +3968,7 @@ async function save() {
 }
 function scheduleSave() {
   clearTimeout(saveTimer);
-  showToast("修改中…", "saving");
+  showToast("修改中...", "saving");
   saveTimer = setTimeout(save, 600);
 }
 // 自动保存：任何设置项变更后防抖保存
@@ -4150,7 +4004,7 @@ function lockBtn(id) {
 function unlockBtn(b) { if (b) { b.disabled = false; b.classList.remove("busy"); } }
 $("btnSyncPrice").onclick = async () => {
   const b = lockBtn("btnSyncPrice"); if (!b) return;
-  showToast("正在同步价格…", "saving");
+  showToast("正在同步价格...", "saving");
   try {
     const st = await (await fetch("/api/settings?syncPrice=1", {cache: "no-store"})).json();
     renderStatus(st);
@@ -4176,7 +4030,7 @@ $("btnSyncQuota").onclick = async () => {
 };
 $("btnConnect").onclick = async () => {
   const b = lockBtn("btnConnect"); if (!b) return;
-  setStatus("正在启动登录窗口…");
+  setStatus("正在启动登录窗口...");
   try {
     const r = await (await fetch("/api/connect", {method: "POST", headers: kh()})).json();
     setStatus(r.message, r.ok ? "ok" : "err");
@@ -4188,7 +4042,7 @@ $("btnConnect").onclick = async () => {
 };
 $("btnSyncSub").onclick = async () => {
   const b = lockBtn("btnSyncSub"); if (!b) return;
-  setStatus("正在同步月额度…");
+  setStatus("正在同步月额度...");
   try {
     const body = JSON.stringify({subscription: {enabled: true, source: document.querySelector("input[name=subMode]:checked").value, persistToken: $("persistToken").checked, token: $("subToken").value.trim()}});
     const r = await (await fetch("/api/settings", {method: "POST", headers: kh(), body: body})).json();
@@ -4204,7 +4058,7 @@ $("btnSyncSub").onclick = async () => {
 };
 $("btnLogout").onclick = async () => {
   const b = lockBtn("btnLogout"); if (!b) return;
-  setStatus("正在清除 Kimi 登录数据…");
+  setStatus("正在清除 Kimi 登录数据...");
   try {
     const r = await (await fetch("/api/logout-kimi", {method: "POST", headers: kh()})).json();
     setStatus(r.message || "已清除", "ok");
@@ -4536,7 +4390,7 @@ def main():
     ap.add_argument("--cycle-day", type=int, default=None, help="计费周期每月起算日（1-31）")
     ap.add_argument("--cycle-hour", type=int, default=None, help="计费周期起算小时（0-23）")
     ap.add_argument("--cycle-minute", type=int, default=None, help="计费周期起算分钟（0-59）")
-    ap.add_argument("--usd-cny", type=float, default=None, help="USD→CNY 汇率（modelsdev 来源时）")
+    ap.add_argument("--usd-cny", type=float, default=None, help="USD->CNY 汇率（modelsdev 来源时）")
     ap.add_argument("--k3-256k-half", action="store_true",
                     help="kimi-code/k3-256k 按 k3 生效价的 50% 计价（默认与 k3 同价）")
     ap.add_argument("--no-quota", action="store_true", help="关闭官方限额同步")
@@ -4608,7 +4462,7 @@ def main():
         with _connect_queue_lock:
             _connect_queue.put_nowait("connect")
             _connect_pending = True
-        print("  配置为 WebView 登录，启动官网订阅同步中…")
+        print("  配置为 WebView 登录，启动官网订阅同步中...")
     try:
         while True:
             _connect_queue.get()
