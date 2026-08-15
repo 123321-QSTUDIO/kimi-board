@@ -16,10 +16,22 @@ type == "usage.record" 且 usageScope == "turn" 的记录（逐 turn 的实际�
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
+
+def is_kimi_model(model: str) -> bool:
+    """只统计 Kimi 系模型：kimi-code/ 前缀，或裸名 k2/k3/kimi 开头。
+    其他厂商模型（如 xiaomi/mimo-xxx）不计入。"""
+    m = (model or "").lower()
+    if not m:
+        return False
+    if "/" in m:
+        return m.startswith("kimi-code/")
+    return m.startswith("kimi") or bool(re.match(r"k\d", m))
 
 
 def kimi_home() -> Path:
@@ -99,6 +111,8 @@ def main() -> int:
     records = 0
 
     for model, wd_key, usage, _t in iter_usage_records(sessions_dir, start_ms, end_ms):
+        if not is_kimi_model(model):
+            continue
         records += 1
         for k in ("inputOther", "inputCacheRead", "inputCacheCreation", "output"):
             v = int(usage.get(k, 0))

@@ -576,6 +576,17 @@ def refresh_pricing(force=False) -> None:
             _pricing_fetching.update(at=now, busy=False, done=True)
 
 
+def is_kimi_model(model: str) -> bool:
+    """只统计 Kimi 系模型：kimi-code/ 前缀，或裸名 k2/k3/kimi 开头（如 k2.7-highspeed）。
+    其他厂商模型（如 xiaomi/mimo-xxx）计费体系不同，用量和费用都不计入。"""
+    m = (model or "").lower()
+    if not m:
+        return False
+    if "/" in m:
+        return m.startswith("kimi-code/")
+    return m.startswith("kimi") or bool(re.match(r"k\d", m))
+
+
 def price_of(model: str):
     """查模型单价；容忍日志里不带 kimi-code/ 前缀的写法。"""
     return (_PRICE_TABLE.get(model)
@@ -873,21 +884,25 @@ def normalize_subscription(raw):
             return v + "+00:00"
         return v
 
+    def limit_value(obj):
+        # 官方在窗口重置后省略 ratio（零用量）：有 resetTime 而无 ratio 视为 0%。
+        # DOM 抓取失败时两者皆 null，不会被误判成 0。
+        ratio = _fnum(obj.get("ratio"))
+        if ratio is None and obj.get("resetTime") and obj.get("enabled", True):
+            ratio = 0.0
+        return {
+            "ratio": ratio,
+            "enabled": bool(obj.get("enabled", True)),
+            "resetTime": reset_value(obj.get("resetTime")),
+        }
+
     return {
         "amountUsedRatio": _fnum(sub.get("amountUsedRatio")),
         "kimiCodeUsedRatio": _fnum(sub.get("kimiCodeUsedRatio")),
         "expireTime": sub.get("expireTime"),
         "planLevel": (user.get("membership") or {}).get("level"),
-        "limits5h": {
-            "ratio": _fnum(r5.get("ratio")),
-            "enabled": bool(r5.get("enabled", True)),
-            "resetTime": reset_value(r5.get("resetTime")),
-        },
-        "limits7d": {
-            "ratio": _fnum(r7.get("ratio")),
-            "enabled": bool(r7.get("enabled", True)),
-            "resetTime": reset_value(r7.get("resetTime")),
-        },
+        "limits5h": limit_value(r5),
+        "limits7d": limit_value(r7),
         "notice": {
             "tip": notice.get("tip"),
             "content": notice.get("content"),
@@ -2202,6 +2217,8 @@ def collect_stats(force=False):
     if sessions_dir.is_dir():
         for wire in sessions_dir.glob("*/*/agents/*/wire.jsonl"):
             for t, model, _sid, usage in scan_wire_file(wire):
+                if not is_kimi_model(model):
+                    continue  # 非 Kimi 模型（如 xiaomi/mimo-xxx）：用量和费用都不统计
                 turns += 1
 
                 def add(bucket):
