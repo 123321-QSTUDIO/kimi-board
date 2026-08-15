@@ -1200,10 +1200,42 @@ def run_connect_webview(port: int) -> None:
           };
         }catch(e){}
       }
+      // 诊断每轮都重建（提前返回的轮次也要刷新，否则 /api/debug 看到的是几十分钟前的快照）
+      window.__kb_dbg={
+        ts:Date.now(),
+        err:window.__kb_lasterr||'',
+        sentHdrs:window.__kb_sentHdrs||[],
+        siteResp:window.__kb_siteResp||'',
+        selfResp:window.__kb_selfResp||'',
+        reqBody:window.__kb_body||'',
+        tokDiag:window.__kb_tokDiag||[],
+        href:(location.href||'').slice(0,90),
+        apifail:window.__kb_apifail?1:0,
+        pending:window.__kb_pending?1:0,
+        hangCount:window.__kb_hangCount||0,
+        failStreak:window.__kb_failStreak||0,
+        // 是否找到 account token（仅布尔，不暴露 token 本身）
+        authFound:(function(){var a=accountAuth();return a?'yes':'no';})(),
+        // 总量 Code 段宽度（调试用，仅数字）
+        codeRatio:(function(){var v=(typeof codeRatioFromBar==='function')?codeRatioFromBar():null;return v!=null?v:'none';})(),
+        // 诊断：5h / 7d 原始文本段（排查限额读错）
+        segSnips:(function(){try{
+          var t=document.body?document.body.innerText:'';
+          var i5=t.indexOf('\u5c0f\u65f6\u7528\u91cf'),i7=t.indexOf('\u5929\u7528\u91cf');
+          var out={h5:(i5>=0&&i7>i5)?t.slice(i5,i5+120):'no h5 seg',d7:(i7>=0)?t.slice(i7,i7+120):'no d7 seg'};
+          return out;
+        }catch(e){return {err:String(e)};}})()
+      };
       if(window.__kb_sub){
         var __r=JSON.stringify(window.__kb_sub);
         window.__kb_sub=null; // 已消费，下一轮重新拉取，保证后台实时刷新拿到新数据
         return __r;
+      }
+      // API 连续失败（多为 access token 过期，或隐藏窗口网络被节流）：
+      // 此时 DOM 数据已冻结在页面加载时的值，必须整页刷新让站点重拉（新 token + 新数据）
+      if((window.__kb_failStreak||0)>=2){
+        window.__kb_failStreak=0;
+        return JSON.stringify({ok:false,reload:'api-dead'});
       }
       // 主路径：selfFetch 调 API（含 Kimi/KimiCode 拆分字段），认证头从 account token 派生。
       // 连续卡死 3 次就永久关掉 selfFetch（隐藏窗口里 fetch 可能永不返回，连接越积越多）
@@ -1226,6 +1258,7 @@ def run_connect_webview(port: int) -> None:
             if(pendTooLong){
               window.__kb_pending=false;
               window.__kb_hangCount=(window.__kb_hangCount||0)+1;
+              window.__kb_failStreak=(window.__kb_failStreak||0)+1;  // 卡死也算失败，攒够就整页刷新
               window.__kb_apifail=true;
               window.__kb_lasterr='stuck:abandon';
             }
@@ -1245,30 +1278,6 @@ def run_connect_webview(port: int) -> None:
         };
         try{document.body.appendChild(b);}catch(e){}
       }
-      window.__kb_dbg={
-        ts:Date.now(),
-        err:window.__kb_lasterr||'',
-        sentHdrs:window.__kb_sentHdrs||[],
-        siteResp:window.__kb_siteResp||'',
-        selfResp:window.__kb_selfResp||'',
-        reqBody:window.__kb_body||'',
-        tokDiag:window.__kb_tokDiag||[],
-        href:(location.href||'').slice(0,90),
-        apifail:window.__kb_apifail?1:0,
-        pending:window.__kb_pending?1:0,
-        hangCount:window.__kb_hangCount||0,
-        // 是否找到 account token（仅布尔，不暴露 token 本身）
-        authFound:(function(){var a=accountAuth();return a?'yes':'no';})(),
-        // 总量 Code 段宽度（调试用，仅数字）
-        codeRatio:(function(){var v=(typeof codeRatioFromBar==='function')?codeRatioFromBar():null;return v!=null?v:'none';})(),
-        // 诊断：5h / 7d 原始文本段（排查限额读错）
-        segSnips:(function(){try{
-          var t=document.body?document.body.innerText:'';
-          var i5=t.indexOf('\u5c0f\u65f6\u7528\u91cf'),i7=t.indexOf('\u5929\u7528\u91cf');
-          var out={h5:(i5>=0&&i7>i5)?t.slice(i5,i5+120):'no h5 seg',d7:(i7>=0)?t.slice(i7,i7+120):'no d7 seg'};
-          return out;
-        }catch(e){return {err:String(e)};}})()
-      };
       return null;
       // ---- helpers ----
       function btnState(ok){
@@ -1382,8 +1391,8 @@ def run_connect_webview(port: int) -> None:
           var F=window.__kb_ofetch||fetch;  // 绕开钩子：自己的请求不进 __kb_hdrs/__kb_body
           F.call(window,U,{method:'POST',headers:hdrs,body:(window.__kb_body||'{}'),credentials:'include',signal:sig})
             .then(function(r){clearTimeout(to);window.__kb_pending=false;window.__kb_lasterr='HTTP '+r.status;return r.ok?r.text():Promise.reject('HTTP '+r.status);})
-            .then(function(t){window.__kb_selfResp=t.slice(0,200);try{var o=JSON.parse(t);capture(o);if(window.__kb_sub){window.__kb_apifail=false;btnState(true);cb&&cb(true,'ok');}else{window.__kb_apifail=true;window.__kb_lasterr='shape';btnState(false);cb&&cb(false,'shape');}}catch(e){window.__kb_apifail=true;window.__kb_lasterr='parse:'+e;btnState(false);cb&&cb(false,'parse');}})
-            .catch(function(e){clearTimeout(to);window.__kb_sub=null;window.__kb_pending=false;window.__kb_apifail=true;window.__kb_lasterr=''+e;btnState(false);cb&&cb(false,String(e));});
+            .then(function(t){window.__kb_selfResp=t.slice(0,200);try{var o=JSON.parse(t);capture(o);if(window.__kb_sub){window.__kb_apifail=false;window.__kb_failStreak=0;btnState(true);cb&&cb(true,'ok');}else{window.__kb_apifail=true;window.__kb_lasterr='shape';btnState(false);cb&&cb(false,'shape');}}catch(e){window.__kb_apifail=true;window.__kb_lasterr='parse:'+e;btnState(false);cb&&cb(false,'parse');}})
+            .catch(function(e){clearTimeout(to);window.__kb_sub=null;window.__kb_pending=false;window.__kb_apifail=true;window.__kb_failStreak=(window.__kb_failStreak||0)+1;window.__kb_lasterr=''+e;btnState(false);cb&&cb(false,String(e));});
         })();
       }
       function numIn(src,re){var m=src.match(re);return m?parseFloat(m[1]):null;}
@@ -1548,7 +1557,13 @@ def run_connect_webview(port: int) -> None:
                             obj = json.loads(res)
                         except Exception:
                             obj = None
-                        if obj and obj.get("ok") and obj.get("data"):
+                        if obj and obj.get("reload"):
+                            # 页面内 API 连续失败（token 过期等）：不落缓存，整页刷新重置
+                            try:
+                                _reload_page(str(obj.get("reload"))[:40])
+                            except Exception as _e:
+                                _webview_dbg["reloadErr"] = str(_e)[:120]
+                        elif obj and obj.get("ok") and obj.get("data"):
                             state["nulls"] = 0
                             _webview_dbg["nullProbe"] = 0
                             if _is_stale(obj["data"]):
