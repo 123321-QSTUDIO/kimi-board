@@ -1169,6 +1169,7 @@ def run_connect_webview(port: int) -> None:
         window.__kb_hooked=true; window.__kb_hdrs=null; window.__kb_apifail=false;
         try{
           var of=window.fetch;
+          window.__kb_ofetch=of;  // selfFetch 用原始 fetch，避免自己的请求污染捕获到的头/体
           window.fetch=function(url,opts){
             var u=typeof url==='string'?url:(url&&url.url);
             if(u&&u.indexOf('GetSubscriptionStats')!==-1){
@@ -1178,8 +1179,10 @@ def run_connect_webview(port: int) -> None:
                   else{for(var k in h){o[k]=h[k];}}
                   window.__kb_hdrs=o;}catch(e){}
               }
+              // 请求体也抓下来：自发的 selfFetch 用 '{}' 可能不是接口期望的报文
+              if(opts&&typeof opts.body==='string'){window.__kb_body=opts.body;}
               var p=of.apply(this,arguments);
-              p.then(function(r){r.clone().text().then(function(t){try{capture(JSON.parse(t));}catch(e){}}).catch(function(){});}).catch(function(){});
+              p.then(function(r){r.clone().text().then(function(t){window.__kb_siteResp=t.slice(0,200);try{capture(JSON.parse(t));}catch(e){}}).catch(function(){});}).catch(function(){});
               return p;
             }
             return of.apply(this,arguments);
@@ -1206,10 +1209,13 @@ def run_connect_webview(port: int) -> None:
       // 连续卡死 3 次就永久关掉 selfFetch（隐藏窗口里 fetch 可能永不返回，连接越积越多）
       if(!window.__kb_pending && (window.__kb_hangCount||0) < 3){ selfFetch(function(){}); }
       // 兜底：DOM 抓取（页面已渲染的数字）。token 过期后 API 持续 401，DOM 是可持续数据源。
-      // 只要 DOM 有数据就用（不被 pending 永久阻塞；API 成功时 capture 会用完整数据覆盖）
+      // 只要 DOM 有数据就用（不被 pending 永久阻塞；API 成功时 capture 会用完整数据覆盖）。
+      // 门槛放宽到任一字段：SPA 登录态抖动重渲染时"总使用量"可能暂时丢失，只认它会卡死。
       try{
         var d=scrapeDom();
-        if(d && (d.subscriptionBalance.amountUsedRatio!=null)){
+        if(d && (d.subscriptionBalance.amountUsedRatio!=null
+              || d.subscriptionBalance.kimiCodeUsedRatio!=null
+              || d.ratelimitCode5h.ratio!=null || d.ratelimitCode7d.ratio!=null)){
           btnState(true);
           // API 在途且未失败时，先等 API（拿拆分字段）；API 已失败则直接用 DOM。
           // 防卡死：pending 超过 15s（隐藏窗口定时器被节流时 abort 不会触发）就放弃等待，
@@ -1240,7 +1246,13 @@ def run_connect_webview(port: int) -> None:
         try{document.body.appendChild(b);}catch(e){}
       }
       window.__kb_dbg={
+        ts:Date.now(),
         err:window.__kb_lasterr||'',
+        sentHdrs:window.__kb_sentHdrs||[],
+        siteResp:window.__kb_siteResp||'',
+        selfResp:window.__kb_selfResp||'',
+        reqBody:window.__kb_body||'',
+        tokDiag:window.__kb_tokDiag||[],
         href:(location.href||'').slice(0,90),
         apifail:window.__kb_apifail?1:0,
         pending:window.__kb_pending?1:0,
@@ -1296,7 +1308,12 @@ def run_connect_webview(port: int) -> None:
         }catch(e){return null;}
       }
       // 在 localStorage/sessionStorage 里找 account token（iss==='account'，含 device_id/ssid/sub）
-      // 接口认证用的是它（不是 cookie 里的 user-center kimi-auth）
+      // 接口认证要 access token；refresh token 同结构但会被拒（token type mismatch）。
+      function tokType(pl){
+        var ks=['type','typ','use','token_use','token_type','tokenType'];
+        for(var i=0;i<ks.length;i++){ if(pl[ks[i]]) return String(pl[ks[i]]); }
+        return '';
+      }
       function accountAuth(){
         var cands=[];
         try{
@@ -1317,9 +1334,17 @@ def run_connect_webview(port: int) -> None:
           for(var i=0;i<cs.length;i++){var p=cs[i].trim();
             if(/^kimi-auth=/.test(p)){cands.push(p.slice(10));}}
         }catch(e){}
+        // 诊断：记录每个 account token 的类型与字段名（不记值，防泄密）
+        var diag=[];
+        var fallback=null;
         for(var c=0;c<cands.length;c++){
           var pl=parseJwt(cands[c]);
-          if(pl&&pl.iss==='account'&&pl.device_id&&pl.ssid){
+          if(!pl||pl.iss!=='account') continue;
+          var tp=tokType(pl);
+          diag.push({t:tp, dev:!!pl.device_id, ssid:!!pl.ssid, keys:Object.keys(pl).sort()});
+          if(tp==='refresh') continue;              // 接口明确拒绝 refresh
+          if(pl.device_id&&pl.ssid){
+            window.__kb_tokDiag=diag;
             return {
               'Authorization':'Bearer '+cands[c],
               'x-msh-device-id':String(pl.device_id),
@@ -1327,7 +1352,10 @@ def run_connect_webview(port: int) -> None:
               'x-traffic-id':String(pl.sub||'')
             };
           }
+          if(!fallback) fallback={tk:cands[c], pl:pl};
         }
+        window.__kb_tokDiag=diag;
+        // 没有类型标记的宽松候选也不用：误用 refresh 只会 401，不如走 DOM
         return null;
       }
       function selfFetch(cb){
@@ -1351,9 +1379,10 @@ def run_connect_webview(port: int) -> None:
         var sig=ctrl?ctrl.signal:undefined;
         var to=setTimeout(function(){try{ctrl&&ctrl.abort();}catch(e){}},8000);
         (function(){
-          fetch(U,{method:'POST',headers:hdrs,body:'{}',credentials:'include',signal:sig})
+          var F=window.__kb_ofetch||fetch;  // 绕开钩子：自己的请求不进 __kb_hdrs/__kb_body
+          F.call(window,U,{method:'POST',headers:hdrs,body:(window.__kb_body||'{}'),credentials:'include',signal:sig})
             .then(function(r){clearTimeout(to);window.__kb_pending=false;window.__kb_lasterr='HTTP '+r.status;return r.ok?r.text():Promise.reject('HTTP '+r.status);})
-            .then(function(t){try{var o=JSON.parse(t);capture(o);window.__kb_apifail=false;btnState(true);cb&&cb(true,'ok');}catch(e){window.__kb_apifail=true;window.__kb_lasterr='parse:'+e;btnState(false);cb&&cb(false,'parse');}})
+            .then(function(t){window.__kb_selfResp=t.slice(0,200);try{var o=JSON.parse(t);capture(o);if(window.__kb_sub){window.__kb_apifail=false;btnState(true);cb&&cb(true,'ok');}else{window.__kb_apifail=true;window.__kb_lasterr='shape';btnState(false);cb&&cb(false,'shape');}}catch(e){window.__kb_apifail=true;window.__kb_lasterr='parse:'+e;btnState(false);cb&&cb(false,'parse');}})
             .catch(function(e){clearTimeout(to);window.__kb_sub=null;window.__kb_pending=false;window.__kb_apifail=true;window.__kb_lasterr=''+e;btnState(false);cb&&cb(false,String(e));});
         })();
       }
@@ -1520,6 +1549,8 @@ def run_connect_webview(port: int) -> None:
                         except Exception:
                             obj = None
                         if obj and obj.get("ok") and obj.get("data"):
+                            state["nulls"] = 0
+                            _webview_dbg["nullProbe"] = 0
                             if _is_stale(obj["data"]):
                                 # 数据已过期：不落缓存（避免给旧数据盖新时间戳），直接整页刷新
                                 try:
@@ -1545,6 +1576,20 @@ def run_connect_webview(port: int) -> None:
                                         _reload_page("keepalive")
                                 except Exception as _e:
                                     _webview_dbg["reloadErr"] = str(_e)[:120]
+                        else:
+                            state["nulls"] = state.get("nulls", 0) + 1
+                            _webview_dbg["nullProbe"] = state["nulls"]
+                    else:
+                        # 探针返回 null（等 API / DOM 暂缺）：连续约 10 轮（~30s）且无弹窗时
+                        # 整页刷新自愈 -- SPA 登录态抖动会重渲染丢字段，reload 让它重拉
+                        state["nulls"] = state.get("nulls", 0) + 1
+                        _webview_dbg["nullProbe"] = state["nulls"]
+                        if state["nulls"] >= 10 and state["ok"]:
+                            state["nulls"] = 0
+                            try:
+                                _reload_page("null-stall")
+                            except Exception as _e:
+                                _webview_dbg["reloadErr"] = str(_e)[:120]
                 except Exception as e:
                     _webview_dbg["probeErr"] = str(e)[:160]
                     _rebuild_if_broken(e)
