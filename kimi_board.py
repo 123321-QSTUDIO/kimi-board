@@ -3464,9 +3464,6 @@ function renderLimits(l) {
       detail.hidden = !wasOpen;
     }
   }
-  if (l.notice) {
-    el.innerHTML += `<div class="quota-empty" style="margin-top:12px">${esc(l.notice)}</div>`;
-  }
 }
 
 async function load(force) {
