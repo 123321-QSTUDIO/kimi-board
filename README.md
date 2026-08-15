@@ -6,9 +6,9 @@
 
 **Kimi Code 本机 token 用量看板**
 
-本地运行 · 零云端依赖 · 零第三方库
+本地运行 · 零云端依赖 · 核心零第三方库（可选 WebView 登录需 pywebview）
 
-[![Release](https://img.shields.io/github/v/release/Pierre1231/kimi-board?style=flat-square)](../../releases)
+[![Release](https://img.shields.io/github/v/release/123321-QSTUDIO/kimi-board?style=flat-square)](../../releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2e6fe8?style=flat-square)](LICENSE)
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-2e6fe8?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS-lightgrey?style=flat-square)
@@ -79,7 +79,7 @@
 
 ## 🐍 从源码运行（任意平台）
 
-要求 Python 3.8+（仅标准库，无第三方依赖）:
+要求 Python 3.8+（核心功能仅用标准库；可选的「连接 Kimi」WebView 登录需 `pip install pywebview`）:
 
 ```bash
 python kimi_board.py                      # 默认 127.0.0.1:8321，自动打开浏览器
@@ -199,6 +199,12 @@ pyinstaller --onefile --name kimi-board kimi_board.py   # 产物在 dist/
 
 打 `v*` 标签推送到 GitHub 会自动构建 exe 并发布 release
 （见 `.github/workflows/release.yml`)。
+
+## 👥 贡献者
+
+- [@Pierre1231](https://github.com/Pierre1231) — 原作者，看板主体与发布流水线
+- [@123321-QSTUDIO](https://github.com/123321-QSTUDIO) — WebView 月额度实时同步
+  （页面内探针直连官网接口）、官方限额强制刷新、扩展侧栏小条重做、跨平台加固
 
 ## 📄 License
 
