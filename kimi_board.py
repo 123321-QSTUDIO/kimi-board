@@ -2100,7 +2100,8 @@ def _ccs_records(cfg: dict):
         placeholders = ",".join("?" for _ in models)
         query = (
             "SELECT created_at, model, input_tokens, output_tokens, "
-            "cache_read_tokens, cache_creation_tokens FROM proxy_request_logs "
+            "cache_read_tokens, cache_creation_tokens, "
+            "input_token_semantics, data_source FROM proxy_request_logs "
             f"WHERE model IN ({placeholders}) AND created_at IS NOT NULL"
         )
         last_error = None
@@ -2126,6 +2127,13 @@ def _ccs_records(cfg: dict):
                         ts = int(row["created_at"])
                         model = str(row["model"] or "")
                         usage = {_CCS_KEY[i]: int(row[_CCS_COL[i]] or 0) for i in range(4)}
+                        # cc-switch 归一化：部分来源的 input_tokens 本身包含缓存命中部分
+                        # （input_token_semantics=1 的直连调用，以及 codex_session/session_log），
+                        # 需减去 cache_read 得到真实"新增输入"，否则缓存被双计进未命中。
+                        if (row["input_token_semantics"] == 1
+                                or row["data_source"] in ("codex_session", "session_log")):
+                            usage["inputOther"] = max(
+                                usage["inputOther"] - usage["inputCacheRead"], 0)
                         records.append((ts, _CCS_MODEL_MAP.get(model, model), usage))
                     except (TypeError, ValueError):
                         continue
@@ -3934,7 +3942,7 @@ function renderStatus(st) {
     $("subState").innerHTML = !s.enabled
       ? '<span class="off">月额度同步已关闭</span>'
       : s.ok
-        ? `已同步（<b class="ok-tag">${srcTxt}</b>）${s.fetchedAt ? " · " + new Date(s.fetchedAt).toLocaleString("zh-CN", {hour12: false}) : ""}${s.message ? " · " + esc(s.message) : ""}${tokTxt}${bgTxt}`
+        ? `已同步（<b class="ok-tag">${esc(srcTxt)}</b>）${s.fetchedAt ? " · " + new Date(s.fetchedAt).toLocaleString("zh-CN", {hour12: false}) : ""}${s.message ? " · " + esc(s.message) : ""}${tokTxt}${bgTxt}`
         : `<b class="bad-tag">暂无数据</b> · ${esc(s.message || "")}${tokTxt}`;
   }
   const cs = st.config && st.config.ccs;
@@ -4258,7 +4266,7 @@ def settings_state(sync_price=False, sync_quota=False) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    # ---- 本地接口防护：Host 回环校验 + Origin 白名单 + 随机 secret ----
+    # ---- 本地接口防护：对端回环校验 + Host 回环校验 + Origin 白名单 + 随机 secret ----
     @staticmethod
     def _host_ok(host: str) -> bool:
         h = (host or "").split(":")[0].strip("[]")
@@ -4268,7 +4276,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Origin") or ""
 
     def _origin_allowed(self):
-        """返回 None=拒绝；'same'/'local'=放行；'ext'=需校验 secret；'read'=只读来源(kimi.com)。"""
+        """返回 None=拒绝；'same'/'local'=放行；'ext'=需校验 secret。"""
         origin = self._origin()
         if not origin:
             return "local"  # 非浏览器来源（本地脚本/进程）
@@ -4279,21 +4287,23 @@ class Handler(BaseHTTPRequestHandler):
             return "local"
         if origin.startswith("chrome-extension://"):
             return "ext"
-        # 插件 content.js 运行在 kimi.com 页面里，读取看板数据展示用（只读，不带凭据）
-        if origin in ("https://www.kimi.com", "https://kimi.com"):
-            return "read"
+        # 外部网站（含 kimi.com）一律拒绝：插件 content.js 只注入本地 WebUI 端口段，
+        # 官网页面没有跨源读取看板数据 / secret 的正当需求
         return None
 
+    def _peer_ok(self) -> bool:
+        # 对端必须是回环地址：即使 --host 绑到非回环，远程请求也一律拒绝（fail-safe）
+        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
     def _authorized(self):
+        if not self._peer_ok():
+            return False
         if not self._host_ok(self.headers.get("Host") or ""):
             return False
         oa = self._origin_allowed()
         if oa is None:
             return False
         if oa == "ext" and self.headers.get("X-KB-Secret") != _local_secret:
-            return False
-        # 只读来源（kimi.com）仅放行 GET；写操作仍需 secret/本地来源
-        if oa == "read" and self.command != "GET":
             return False
         return True
 
@@ -4302,7 +4312,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         oa = self._origin_allowed()
-        if oa is None or not self._host_ok(self.headers.get("Host") or ""):
+        if oa is None or not self._host_ok(self.headers.get("Host") or "") or not self._peer_ok():
             self._deny()
             return
         self.send_response(204)
@@ -4347,9 +4357,6 @@ class Handler(BaseHTTPRequestHandler):
         elif path.path.startswith("/api/subscription"):
             q = urllib.parse.parse_qs(path.query)
             body = json.dumps(subscription_snapshot(CFG, force="refresh" in q), ensure_ascii=False).encode("utf-8")
-            self._send(200, "application/json; charset=utf-8", body)
-        elif path.path.startswith("/api/connect"):
-            body = json.dumps(_open_connect(), ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         elif path.path.startswith("/api/version"):
             body = json.dumps(check_update(), ensure_ascii=False).encode("utf-8")
@@ -4405,6 +4412,11 @@ class Handler(BaseHTTPRequestHandler):
                 raw = "{}"
             q = urllib.parse.parse_qs(path.query)
             source = (q.get("source") or ["auto"])[0]
+            # source 会存入缓存并渲染到设置页：只收白名单值，杜绝存储型注入
+            if source not in ("auto", "webview", "extension", "manual"):
+                self._send(400, "application/json; charset=utf-8",
+                           b'{"error":"invalid source"}')
+                return
             resp = handle_subscription_post(raw, source)
             self._send(200, "application/json; charset=utf-8",
                        json.dumps(resp, ensure_ascii=False).encode("utf-8"))
@@ -4514,6 +4526,8 @@ def main():
     server = QuietHTTPServer((args.host, args.port), Handler)
     SERVER_PORT = args.port
     url = f"http://{args.host}:{args.port}"
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print("  警告：--host 为非回环地址。出于安全考虑，远程对端会被一律拒绝（仅本机回环可访问）。")
     print(f"kimi code token 看板已启动：{url}  (Ctrl+C 停止)")
     print(f"  设置页：{url}/settings · 配置文件：{config_path()}")
     if not args.no_open:
