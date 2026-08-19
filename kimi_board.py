@@ -1053,6 +1053,23 @@ def _store_subscription(norm: dict, source: str) -> None:
     _websub.update(at=time.time(), data=stored)
 
 
+def _sync_billing_anchor(cfg: dict, expire_iso) -> bool:
+    """用官网 expireTime（当前账期结束 = 下周期起算点）自动校准 billing.day/hour/minute。
+    续费日漂移（如 20 号 -> 19 号）时"本账期"统计随之纠正；返回是否有改动。"""
+    if not expire_iso:
+        return False
+    try:
+        exp = datetime.fromisoformat(str(expire_iso).replace("Z", "+00:00")).astimezone()
+    except (ValueError, TypeError):
+        return False
+    bill = cfg.setdefault("billing", {})
+    new = {"day": exp.day, "hour": exp.hour, "minute": exp.minute}
+    if all(int(bill.get(k, -1)) == v for k, v in new.items()):
+        return False
+    bill.update(new)
+    return True
+
+
 def handle_subscription_post(raw, source: str) -> dict:
     """WebView / 扩展推送：按配置的 subscription.source 做来源过滤。
 
@@ -1071,6 +1088,9 @@ def handle_subscription_post(raw, source: str) -> dict:
     if norm is None:
         return {"ok": False, "error": "不是 GetSubscriptionStats 的返回结构"}
     _store_subscription(norm, source)
+    # 官网数据自带账期结束时间：自动校准计费周期起算点（manual 是手贴数据，不动配置）
+    if source in ("webview", "extension") and _sync_billing_anchor(cfg, norm.get("expireTime")):
+        save_config(cfg)
     return {"ok": True}
 
 
